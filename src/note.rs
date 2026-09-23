@@ -183,6 +183,9 @@ pub fn parse_note(text: &str) -> (NoteMeta, String) {
     }
 
     let meta = serde_yaml_ng::from_str::<NoteMeta>(&yaml).unwrap_or_default();
+    // Drop the blank separator line(s) we write after the closing `---` fence so
+    // the editor does not open with a leading empty line.
+    let body = body.trim_start_matches(['\n', '\r']).to_string();
     (meta, body)
 }
 
@@ -275,5 +278,14 @@ mod tests {
         let (parsed, body) = parse_note(&text);
         assert_eq!(parsed.id, meta.id);
         assert!(body.trim().is_empty());
+    }
+
+    #[test]
+    fn frontmatter_separator_is_not_part_of_body() {
+        let meta = NoteMeta::default();
+        let text = serialize_note(&meta, "# Title\nbody\n");
+        let (_, body) = parse_note(&text);
+        assert!(!body.starts_with('\n'), "body started with a blank line");
+        assert_eq!(body, "# Title\nbody\n");
     }
 }
