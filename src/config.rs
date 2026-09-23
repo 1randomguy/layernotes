@@ -5,7 +5,7 @@ use inotify::{Inotify, WatchMask};
 use serde::{Deserialize, Serialize};
 
 use iced::Subscription;
-use iced::futures::StreamExt;
+use iced::futures::{SinkExt, StreamExt};
 use iced::stream;
 
 use crate::xdg;
@@ -26,10 +26,15 @@ pub struct Config {
     pub scale_factor: f64,
     pub default_width: f32,
     pub default_height: f32,
-    pub default_color: String,
-    pub show_new_button: bool,
+    /// Optional fixed background for new notes. When unset, the active theme's
+    /// yellow is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_color: Option<String>,
     pub autosave_debounce_ms: u64,
-    pub theme: ThemeConfig,
+    /// Colour theme used for the note chrome (buttons, borders, text).
+    pub theme: Theme,
+    /// Markdown rendering tweaks.
+    pub markdown: MarkdownConfig,
 }
 
 impl Default for Config {
@@ -43,10 +48,10 @@ impl Default for Config {
             scale_factor: 1.0,
             default_width: 260.0,
             default_height: 220.0,
-            default_color: "#f9e2af".to_owned(),
-            show_new_button: true,
+            default_color: None,
             autosave_debounce_ms: 500,
-            theme: ThemeConfig::default(),
+            theme: Theme::default(),
+            markdown: MarkdownConfig::default(),
         }
     }
 }
@@ -90,24 +95,57 @@ pub enum Layer {
     Overlay,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ThemeConfig {
-    pub text: String,
-    pub muted: String,
-    pub accent: String,
-    pub border: String,
-    pub button_bg: String,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    CatppuccinMocha,
+    CatppuccinMacchiato,
+    CatppuccinFrappe,
+    CatppuccinLatte,
+    Dark,
+    Light,
 }
 
-impl Default for ThemeConfig {
+impl Theme {
+    /// The corresponding iced theme, used both for the app and to derive the
+    /// note chrome palette.
+    pub fn iced(self) -> iced::Theme {
+        match self {
+            Theme::CatppuccinMocha => iced::Theme::CatppuccinMocha,
+            Theme::CatppuccinMacchiato => iced::Theme::CatppuccinMacchiato,
+            Theme::CatppuccinFrappe => iced::Theme::CatppuccinFrappe,
+            Theme::CatppuccinLatte => iced::Theme::CatppuccinLatte,
+            Theme::Dark => iced::Theme::Dark,
+            Theme::Light => iced::Theme::Light,
+        }
+    }
+}
+
+/// Multipliers applied to the note font size when rendering markdown.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MarkdownConfig {
+    pub h1_scale: f32,
+    pub h2_scale: f32,
+    pub h3_scale: f32,
+    pub h4_scale: f32,
+    pub h5_scale: f32,
+    pub h6_scale: f32,
+    pub code_scale: f32,
+    pub spacing_scale: f32,
+}
+
+impl Default for MarkdownConfig {
     fn default() -> Self {
         Self {
-            text: "#cdd6f4".to_owned(),
-            muted: "#7f849c".to_owned(),
-            accent: "#89b4fa".to_owned(),
-            border: "#45475a".to_owned(),
-            button_bg: "#313244".to_owned(),
+            h1_scale: 1.5,
+            h2_scale: 1.35,
+            h3_scale: 1.2,
+            h4_scale: 1.1,
+            h5_scale: 1.0,
+            h6_scale: 0.95,
+            code_scale: 0.8,
+            spacing_scale: 0.75,
         }
     }
 }
@@ -137,8 +175,8 @@ pub fn get_config(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
 }
 
 pub fn read_config(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read config {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))
 }
 

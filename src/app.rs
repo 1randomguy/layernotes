@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::Local;
 use uuid::Uuid;
@@ -18,6 +19,11 @@ use crate::store;
 use crate::theme::Palette;
 use crate::widgets;
 
+/// How long a drag may stay alive after the pointer leaves a surface before it
+/// is considered dropped on a foreign surface (a window, the bar, ...). Gives
+/// the pointer time to enter another layernotes surface on a different monitor.
+const LEAVE_GRACE: Duration = Duration::from_millis(120);
+
 #[derive(Debug, Clone, Copy)]
 struct Drag {
     window: window::Id,
@@ -34,23 +40,32 @@ struct Resize {
     start_size: Size,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingLeave {
+    window: window::Id,
+    token: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     OutputEvent(OutputEvent),
     ConfigChanged,
     NotesChanged,
     EscapePressed,
-    BackgroundPressed(SurfaceId),
+    BackgroundPressed,
     NewNote(SurfaceId),
-    Select(SurfaceId, Uuid),
-    ToggleEdit(SurfaceId, Uuid),
+    Select(Uuid),
+    ToggleEdit(Uuid),
     DeleteNote(Uuid),
     DragStart(SurfaceId, Uuid),
     ResizeStart(SurfaceId, Uuid),
-    EditorAction(SurfaceId, Uuid, text_editor::Action),
+    EditorAction(Uuid, text_editor::Action),
     LinkClicked(String),
     CursorMoved(window::Id, Point),
+    CursorEntered(window::Id),
     CursorReleased(window::Id),
+    CursorLeft(window::Id),
+    ConfirmLeave(u64),
     SaveNote(Uuid),
     NoteSaved(Uuid, Result<(), String>),
 }
@@ -65,7 +80,10 @@ pub struct App {
     drag: Option<Drag>,
     resize: Option<Resize>,
     cursor: HashMap<window::Id, Point>,
+    pointer_over: Option<window::Id>,
     save_handles: HashMap<Uuid, iced::task::Handle>,
+    pending_leave: Option<PendingLeave>,
+    leave_token: u64,
 }
 
 impl App {
@@ -84,8 +102,9 @@ impl App {
             notes.push(welcome);
         }
 
-        let palette = Palette::from_config(&config.theme);
+        let palette = Palette::from_theme(config.theme);
         let outputs = Outputs::new(config.layer);
+        log::info!("Using theme {:?}", config.theme);
 
         (
             Self {
@@ -98,14 +117,17 @@ impl App {
                 drag: None,
                 resize: None,
                 cursor: HashMap::new(),
+                pointer_over: None,
                 save_handles: HashMap::new(),
+                pending_leave: None,
+                leave_token: 0,
             },
             Task::none(),
         )
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::CatppuccinMocha
+        self.config.theme.iced()
     }
 
     pub fn scale_factor(&self) -> f64 {
@@ -120,10 +142,10 @@ impl App {
                 self.reload_notes();
                 Task::none()
             }
-            Message::EscapePressed | Message::BackgroundPressed(_) => self.exit_editing(),
+            Message::EscapePressed | Message::BackgroundPressed => self.exit_editing(),
             Message::NewNote(surface) => self.new_note(surface),
-            Message::Select(_, id) => self.select(id),
-            Message::ToggleEdit(_, id) => self.toggle_edit(id),
+            Message::Select(id) => self.select(id),
+            Message::ToggleEdit(id) => self.toggle_edit(id),
             Message::DeleteNote(id) => self.delete_note(id),
             Message::DragStart(surface, id) => {
                 self.drag_start(surface, id);
@@ -133,7 +155,7 @@ impl App {
                 self.resize_start(surface, id);
                 Task::none()
             }
-            Message::EditorAction(_, id, action) => self.editor_action(id, action),
+            Message::EditorAction(id, action) => self.editor_action(id, action),
             Message::LinkClicked(url) => {
                 self.open_link(&url);
                 Task::none()
@@ -143,6 +165,12 @@ impl App {
                 Task::none()
             }
             Message::CursorReleased(window) => self.cursor_released(window),
+            Message::CursorEntered(window) => {
+                self.cursor_entered(window);
+                Task::none()
+            }
+            Message::CursorLeft(window) => self.cursor_left(window),
+            Message::ConfirmLeave(token) => self.confirm_leave(token),
             Message::SaveNote(id) => self.save_task(id),
             Message::NoteSaved(id, result) => {
                 if let Err(e) = result {
@@ -158,22 +186,15 @@ impl App {
 
     pub fn view(&self, id: SurfaceId) -> Element<'_, Message> {
         let Some(entry) = self.outputs.get(id) else {
-            return Space::new()
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+            return Space::new().width(Length::Fill).height(Length::Fill).into();
         };
         let surface_name = entry.name.clone();
-        let logical_size = entry.logical_size;
 
         let mut stack = Stack::new().push(
-            mouse_area(
-                Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .on_press(Message::BackgroundPressed(id))
-            .on_double_click(Message::NewNote(id)),
+            mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::BackgroundPressed)
+                .on_right_press(Message::BackgroundPressed)
+                .on_double_click(Message::NewNote(id)),
         );
 
         for note in &self.notes {
@@ -183,16 +204,6 @@ impl App {
             let selected = self.active == Some(note.meta.id);
             let card = widgets::note_card(note, id, selected, &self.config, &self.palette);
             stack = stack.push(pin(card).x(note.meta.x).y(note.meta.y));
-        }
-
-        if self.config.show_new_button
-            && let Some((width, height)) = logical_size
-        {
-            stack = stack.push(
-                pin(widgets::new_note_button(id, &self.palette))
-                    .x((width as f32) - 60.0)
-                    .y((height as f32) - 60.0),
-            );
         }
 
         stack.into()
@@ -207,17 +218,19 @@ impl App {
                 iced::event::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(window, position))
                 }
+                iced::event::Event::Mouse(mouse::Event::CursorEntered) => {
+                    Some(Message::CursorEntered(window))
+                }
                 iced::event::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                     Some(Message::CursorReleased(window))
                 }
-                iced::event::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
-                    match key {
-                        keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                            Some(Message::EscapePressed)
-                        }
-                        _ => None,
-                    }
+                iced::event::Event::Mouse(mouse::Event::CursorLeft) => {
+                    Some(Message::CursorLeft(window))
                 }
+                iced::event::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::EscapePressed),
                 _ => None,
             }),
         ])
@@ -239,6 +252,16 @@ impl App {
             Some(name) if self.outputs.has_name(name) => Some(name.to_owned()),
             _ => Some(primary),
         }
+    }
+
+    /// The output name of the surface backing the given window id, if it is one
+    /// of ours.
+    fn output_name_for_window(&self, window: window::Id) -> Option<String> {
+        self.outputs
+            .entries
+            .iter()
+            .find(|entry| window::Id::from(entry.surface_id) == window)
+            .map(|entry| entry.name.clone())
     }
 
     fn output_bounds_for_note(&self, id: Uuid) -> Option<(f32, f32)> {
@@ -452,12 +475,21 @@ impl App {
     fn cursor_moved(&mut self, window: window::Id, point: Point) {
         self.cursor.insert(window, point);
 
-        if let Some(drag) = self
-            .drag
-            .as_ref()
-            .filter(|drag| drag.window == window)
-            .copied()
-        {
+        // Hand an in-flight drag/resize over to this surface if it started on a
+        // different one (the pointer crossed to another monitor).
+        if self.output_name_for_window(window).is_some() {
+            if self.drag.is_some() || self.resize.is_some() {
+                self.pending_leave = None;
+            }
+            if self.drag.is_some_and(|drag| drag.window != window) {
+                self.retarget_drag(window, point);
+            }
+            if self.resize.is_some_and(|resize| resize.window != window) {
+                self.retarget_resize(window, point);
+            }
+        }
+
+        if let Some(drag) = self.drag.filter(|drag| drag.window == window) {
             let bounds = self.output_bounds_for_note(drag.note);
             if let Some(note) = self.find_note_mut(drag.note) {
                 let mut x = drag.start_pos.x + (point.x - drag.start_cursor.x);
@@ -477,15 +509,11 @@ impl App {
             }
         }
 
-        if let Some(resize) = self
-            .resize
-            .as_ref()
-            .filter(|resize| resize.window == window)
-            .copied()
-        {
+        if let Some(resize) = self.resize.filter(|resize| resize.window == window) {
             let bounds = self.output_bounds_for_note(resize.note);
             if let Some(note) = self.find_note_mut(resize.note) {
-                let mut width = (resize.start_size.width + (point.x - resize.start_cursor.x)).max(140.0);
+                let mut width =
+                    (resize.start_size.width + (point.x - resize.start_cursor.x)).max(140.0);
                 let mut height =
                     (resize.start_size.height + (point.y - resize.start_cursor.y)).max(100.0);
                 if let Some((ow, oh)) = bounds {
@@ -498,22 +526,150 @@ impl App {
         }
     }
 
-    fn cursor_released(&mut self, window: window::Id) -> Task<Message> {
-        if let Some(drag) = self
-            .drag
-            .as_ref()
-            .filter(|drag| drag.window == window)
-            .copied()
+    fn cursor_entered(&mut self, window: window::Id) {
+        self.pointer_over = Some(window);
+
+        // Entering any of our surfaces keeps a cross-monitor drag alive.
+        if self.output_name_for_window(window).is_some()
+            && (self.drag.is_some() || self.resize.is_some())
         {
+            self.pending_leave = None;
+        }
+    }
+
+    /// Re-home an in-flight drag onto another of our surfaces, preserving the
+    /// grab offset so the note does not jump under the cursor.
+    fn retarget_drag(&mut self, window: window::Id, point: Point) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        self.pending_leave = None;
+
+        let grab_x = drag.start_cursor.x - drag.start_pos.x;
+        let grab_y = drag.start_cursor.y - drag.start_pos.y;
+        let start_pos = Point::new(point.x - grab_x, point.y - grab_y);
+
+        if let Some(name) = self.output_name_for_window(window)
+            && let Some(note) = self.find_note_mut(drag.note)
+        {
+            note.meta.output = Some(name);
+            note.meta.x = start_pos.x.max(0.0);
+            note.meta.y = start_pos.y.max(0.0);
+        }
+
+        self.drag = Some(Drag {
+            window,
+            note: drag.note,
+            start_cursor: point,
+            start_pos,
+        });
+    }
+
+    fn retarget_resize(&mut self, window: window::Id, point: Point) {
+        let Some(resize) = self.resize else {
+            return;
+        };
+        self.pending_leave = None;
+
+        if let Some(name) = self.output_name_for_window(window)
+            && let Some(note) = self.find_note_mut(resize.note)
+        {
+            note.meta.output = Some(name);
+        }
+
+        self.resize = Some(Resize {
+            window,
+            note: resize.note,
+            start_cursor: point,
+            start_size: resize.start_size,
+        });
+    }
+
+    fn cursor_released(&mut self, window: window::Id) -> Task<Message> {
+        // Releasing on a different surface transfers the drag there first.
+        if self.output_name_for_window(window).is_some() {
+            if self.drag.is_some_and(|drag| drag.window != window) {
+                let point = self.cursor.get(&window).copied();
+                if let Some(point) = point {
+                    self.retarget_drag(window, point);
+                } else if let Some(name) = self.output_name_for_window(window)
+                    && let Some(drag) = self.drag
+                    && let Some(note) = self.find_note_mut(drag.note)
+                {
+                    note.meta.output = Some(name);
+                }
+            }
+            if self.resize.is_some_and(|resize| resize.window != window)
+                && let Some(name) = self.output_name_for_window(window)
+                && let Some(resize) = self.resize
+                && let Some(note) = self.find_note_mut(resize.note)
+            {
+                note.meta.output = Some(name);
+            }
+        }
+
+        if let Some(drag) = self.drag.filter(|drag| drag.window == window) {
+            self.drag = None;
+            self.pending_leave = None;
+            return self.save_task(drag.note);
+        }
+        if let Some(resize) = self.resize.filter(|resize| resize.window == window) {
+            self.resize = None;
+            self.pending_leave = None;
+            return self.save_task(resize.note);
+        }
+        Task::none()
+    }
+
+    /// The pointer left this surface, so it is now over another surface (a
+    /// window, the bar, another monitor, ...). Leave editing mode, and give an
+    /// in-flight drag a grace period to be picked up by another monitor before
+    /// treating it as dropped.
+    fn cursor_left(&mut self, window: window::Id) -> Task<Message> {
+        if self.pointer_over == Some(window) {
+            self.pointer_over = None;
+        }
+
+        let mut tasks = vec![self.exit_editing()];
+
+        let dragging = self.drag.is_some_and(|drag| drag.window == window)
+            || self.resize.is_some_and(|resize| resize.window == window);
+
+        if dragging {
+            self.leave_token += 1;
+            let token = self.leave_token;
+            self.pending_leave = Some(PendingLeave { window, token });
+            tasks.push(Task::perform(
+                async move {
+                    tokio::time::sleep(LEAVE_GRACE).await;
+                },
+                move |()| Message::ConfirmLeave(token),
+            ));
+        }
+
+        Task::batch(tasks)
+    }
+
+    fn confirm_leave(&mut self, token: u64) -> Task<Message> {
+        let Some(pending) = self.pending_leave.filter(|pending| pending.token == token) else {
+            return Task::none();
+        };
+        self.pending_leave = None;
+
+        // The pointer is still on one of our surfaces (likely another monitor),
+        // so the drag lives on until it moves or is released there.
+        if let Some(over) = self.pointer_over
+            && over != pending.window
+            && self.output_name_for_window(over).is_some()
+        {
+            return Task::none();
+        }
+
+        if let Some(drag) = self.drag.filter(|drag| drag.window == pending.window) {
             self.drag = None;
             return self.save_task(drag.note);
         }
-        if let Some(resize) = self
-            .resize
-            .as_ref()
-            .filter(|resize| resize.window == window)
-            .copied()
-        {
+        if let Some(resize) = self.resize.filter(|resize| resize.window == pending.window) {
             self.resize = None;
             return self.save_task(resize.note);
         }
@@ -554,8 +710,10 @@ impl App {
 
     fn reload_notes(&mut self) {
         let loaded = store::load_notes(&self.config.notes_path(), &self.config);
-        let mut by_id: HashMap<Uuid, Note> =
-            loaded.into_iter().map(|note| (note.meta.id, note)).collect();
+        let mut by_id: HashMap<Uuid, Note> = loaded
+            .into_iter()
+            .map(|note| (note.meta.id, note))
+            .collect();
         let mut merged = Vec::new();
 
         for note in self.notes.drain(..) {
@@ -617,7 +775,7 @@ impl App {
                 let notes_dir_changed = new_config.notes_path() != self.config.notes_path();
                 let layer_changed = new_config.layer != self.config.layer;
                 self.config = new_config;
-                self.palette = Palette::from_config(&self.config.theme);
+                self.palette = Palette::from_theme(self.config.theme);
 
                 let mut tasks = Vec::new();
                 if layer_changed {

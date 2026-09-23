@@ -49,7 +49,6 @@ tokio = { version = "1", default-features = false, features = [
   "fs",
   "time",
 ] }
-libc = "0.2"
 
 [patch.crates-io]
 # Patched softbuffer that uses wl_shm Argb8888 so the tiny-skia fallback

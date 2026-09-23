@@ -86,7 +86,7 @@ impl Note {
             y,
             width: config.default_width,
             height: config.default_height,
-            color: Some(config.default_color.clone()),
+            color: config.default_color.clone(),
             output,
             ..NoteMeta::default()
         };
@@ -105,7 +105,7 @@ impl Note {
             meta.height = config.default_height;
         }
         if meta.color.is_none() {
-            meta.color = Some(config.default_color.clone());
+            meta.color = config.default_color.clone();
         }
         Ok(Self::new(meta, body, path.to_path_buf()))
     }
@@ -120,24 +120,15 @@ impl Note {
         self.items = markdown::parse(&self.body).collect();
     }
 
-    /// Ensure an editor buffer exists, seeded from the current body.
+    /// Ensure an editor buffer exists, seeded from the current body with the
+    /// cursor placed at the end of the note.
     pub fn editor_mut(&mut self) -> &mut text_editor::Content {
         if self.editor.is_none() {
-            self.editor = Some(text_editor::Content::with_text(&self.body));
+            let mut content = text_editor::Content::with_text(&self.body);
+            content.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            self.editor = Some(content);
         }
         self.editor.as_mut().expect("editor just created")
-    }
-
-    /// Copy the editor buffer back into `body` and refresh the rendered items.
-    pub fn commit_editor(&mut self) {
-        if let Some(editor) = &self.editor {
-            let text = editor.text();
-            if text != self.body {
-                self.body = text;
-                self.refresh_items();
-            }
-        }
-        self.editor = None;
     }
 
     /// A short human readable title for the note header.

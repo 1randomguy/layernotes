@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use iced::Subscription;
-use iced::futures::StreamExt;
+use iced::futures::{SinkExt, StreamExt};
 use iced::stream;
 use inotify::{Inotify, WatchMask};
 
@@ -94,7 +94,7 @@ pub fn subscription(dir: PathBuf) -> Subscription<()> {
                     event
                         .name
                         .as_ref()
-                        .map_or(true, |name| name.to_string_lossy().ends_with(".md"))
+                        .is_none_or(|name| name.to_string_lossy().ends_with(".md"))
                 });
 
                 if relevant && output.send(()).await.is_err() {

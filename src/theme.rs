@@ -1,27 +1,64 @@
 use iced::Color;
 
-use crate::config::ThemeConfig;
+use crate::config::Theme;
 
+/// Colours used for note chrome, derived from the active theme.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
     pub text: Color,
-    pub muted: Color,
     pub accent: Color,
     pub border: Color,
     pub button_bg: Color,
     pub shadow: Color,
+    /// Default note background for the active theme.
+    pub note: Color,
 }
 
 impl Palette {
-    pub fn from_config(theme: &ThemeConfig) -> Self {
+    pub fn from_theme(theme: Theme) -> Self {
+        // Official Catppuccin palettes: base, surface0, surface1, text, mauve.
+        let (base, surface0, surface1, text, mauve) = match theme {
+            Theme::CatppuccinMocha => (0x1e1e2e, 0x313244, 0x45475a, 0xcdd6f4, 0xcba6f7),
+            Theme::CatppuccinMacchiato => (0x24273a, 0x363a4f, 0x494d64, 0xcad3f5, 0xc6a0f6),
+            Theme::CatppuccinFrappe => (0x303446, 0x414559, 0x51576d, 0xc6d0f5, 0xca9ee6),
+            Theme::CatppuccinLatte => (0xeff1f5, 0xccd0da, 0xbcc0cc, 0x4c4f69, 0x8839ef),
+            Theme::Dark | Theme::Light => {
+                let iced_theme = theme.iced();
+                let extended = iced_theme.extended_palette();
+                return Self {
+                    text: extended.background.base.text,
+                    accent: extended.primary.base.color,
+                    border: extended.background.strong.color,
+                    button_bg: extended.background.weak.color,
+                    shadow: shadow_for(theme),
+                    note: extended.background.base.color,
+                };
+            }
+        };
+
         Self {
-            text: parse_hex(&theme.text).unwrap_or(Color::from_rgb8(0xcd, 0xd6, 0xf4)),
-            muted: parse_hex(&theme.muted).unwrap_or(Color::from_rgb8(0x7f, 0x84, 0x9c)),
-            accent: parse_hex(&theme.accent).unwrap_or(Color::from_rgb8(0x89, 0xb4, 0xfa)),
-            border: parse_hex(&theme.border).unwrap_or(Color::from_rgb8(0x45, 0x47, 0x5a)),
-            button_bg: parse_hex(&theme.button_bg).unwrap_or(Color::from_rgb8(0x31, 0x32, 0x44)),
-            shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+            text: rgb(text),
+            accent: rgb(mauve),
+            border: rgb(surface1),
+            button_bg: rgb(surface0),
+            shadow: shadow_for(theme),
+            note: rgb(base),
         }
+    }
+}
+
+fn rgb(hex: u32) -> Color {
+    Color::from_rgb8(
+        (hex >> 16) as u8,
+        ((hex >> 8) & 0xff) as u8,
+        (hex & 0xff) as u8,
+    )
+}
+
+fn shadow_for(theme: Theme) -> Color {
+    match theme {
+        Theme::CatppuccinLatte | Theme::Light => Color::from_rgba(0.0, 0.0, 0.0, 0.18),
+        _ => Color::from_rgba(0.0, 0.0, 0.0, 0.35),
     }
 }
 
@@ -57,5 +94,36 @@ pub fn contrast_text(background: Color) -> Color {
         Color::from_rgb8(0x1e, 0x1e, 0x2e)
     } else {
         Color::from_rgb8(0xcd, 0xd6, 0xf4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_forms() {
+        assert_eq!(
+            parse_hex("#f9e2af"),
+            Some(Color::from_rgb8(0xf9, 0xe2, 0xaf))
+        );
+        assert_eq!(parse_hex("fff"), Some(Color::from_rgb8(0xff, 0xff, 0xff)));
+        assert_eq!(parse_hex("nope"), None);
+    }
+
+    #[test]
+    fn themes_differ() {
+        let mocha = Palette::from_theme(Theme::CatppuccinMocha);
+        let latte = Palette::from_theme(Theme::CatppuccinLatte);
+        assert_ne!(mocha.note, latte.note);
+        assert_ne!(mocha.text, latte.text);
+    }
+
+    #[test]
+    fn mocha_uses_base_and_mauve() {
+        let mocha = Palette::from_theme(Theme::CatppuccinMocha);
+        assert_eq!(mocha.note, Color::from_rgb8(0x1e, 0x1e, 0x2e));
+        assert_eq!(mocha.accent, Color::from_rgb8(0xcb, 0xa6, 0xf7));
+        assert_eq!(mocha.text, Color::from_rgb8(0xcd, 0xd6, 0xf4));
     }
 }
