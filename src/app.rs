@@ -6,10 +6,10 @@ use chrono::Local;
 use uuid::Uuid;
 
 use iced::event::listen_with;
-use iced::widget::{Space, Stack, mouse_area, pin, text_editor};
+use iced::widget::{Space, Stack, container, mouse_area, pin, text_editor};
 use iced::{
     Anchor, Element, InputRegionRect, KeyboardInteractivity, Layer, LayerShellSettings, Length,
-    OutputEvent, OutputId, Point, Size, Subscription, SurfaceId, Task, Theme,
+    OutputEvent, OutputId, Padding, Point, Size, Subscription, SurfaceId, Task, Theme, alignment,
     destroy_layer_surface, keyboard, mouse, new_layer_surface, set_input_region, window,
 };
 
@@ -302,16 +302,23 @@ impl App {
         }
 
         // Bottom-right button opening the rescue board, only when there are
-        // notes stranded on disconnected monitors.
+        // notes stranded on disconnected monitors. Placed by a fullscreen
+        // container aligned to the corner so it never depends on button size.
         let orphan_count: usize = self.orphan_groups().iter().map(|(_, ids)| ids.len()).sum();
-        if orphan_count > 0
-            && let Some((width, height)) = surface_size
-        {
+        if orphan_count > 0 {
             let button = widgets::rescue_button(id, orphan_count, &self.palette);
             stack = stack.push(
-                pin(button)
-                    .x((width as f32) - 88.0)
-                    .y((height as f32) - 52.0),
+                container(button)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(Padding {
+                        top: 0.0,
+                        right: 16.0,
+                        bottom: 8.0,
+                        left: 0.0,
+                    })
+                    .align_x(alignment::Horizontal::Right)
+                    .align_y(alignment::Vertical::Bottom),
             );
         }
 
