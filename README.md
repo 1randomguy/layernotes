@@ -23,6 +23,13 @@ backend for iced 0.14, and the Elm architecture.
   one monitor to another.
 - Create notes by double-clicking empty desktop.
 - Delete notes with a two-step confirm button.
+- Disconnected monitors: notes assigned to an unplugged monitor are not dropped
+  onto the desktop at stale coordinates. A small count button appears in the
+  bottom-right corner; it opens a **rescue board** grouping those notes by
+  monitor, with per-note "Move here" and per-monitor "Move all here". Moving a
+  note cascades it onto the monitor the board is shown on, and it is saved to
+  its frontmatter. Reconnecting the monitor (same name) returns its notes
+  automatically.
 - Notes are watched with `inotify`, so edits made in another editor are picked
   up live. The config file is hot-reloaded too.
 - Autosave is debounced; geometry changes save on release.
@@ -124,6 +131,9 @@ cargo build --release
   target monitor and the note is re-homed there).
 - **Resize**: drag the bottom-right corner.
 - **Delete**: click `x`, then `sure?` to confirm.
+- **Disconnected monitor**: click the bottom-right count button to open the
+  rescue board; use **Move here** on a note, or **Move all here** for a whole
+  monitor. Close with `×`, `Esc`, or by clicking outside the panel.
 
 ## Project layout
 

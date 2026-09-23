@@ -64,6 +64,16 @@ struct Catcher {
 }
 
 const CATCHER_NAMESPACE: &str = "layernotes-catcher";
+const BOARD_NAMESPACE: &str = "layernotes-rescue";
+
+/// The rescue board surface: a fullscreen Overlay panel listing notes whose
+/// monitor is disconnected. Created on demand and destroyed when closed.
+#[derive(Debug, Clone)]
+struct BoardSurface {
+    surface_id: SurfaceId,
+    /// Output the board is shown on; notes are moved here.
+    output_name: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -74,6 +84,10 @@ pub enum Message {
     BackgroundPressed,
     ClickCatcherPressed,
     RefreshCatchers,
+    OpenRescueBoard(SurfaceId),
+    CloseRescueBoard,
+    MoveNoteHere(Uuid),
+    MoveAllHere(String),
     NewNote(SurfaceId),
     Select(Uuid),
     ToggleEdit(Uuid),
@@ -108,6 +122,7 @@ pub struct App {
     last_config_error: Option<String>,
     catchers: Vec<Catcher>,
     output_geometries: HashMap<String, OutputRect>,
+    board: Option<BoardSurface>,
 }
 
 impl App {
@@ -148,6 +163,7 @@ impl App {
                 last_config_error: None,
                 catchers: Vec::new(),
                 output_geometries: geometry::enumerate(),
+                board: None,
             },
             Task::none(),
         )
@@ -163,7 +179,7 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        Task::batch(vec![task, self.prune_catchers()])
+        Task::batch(vec![task, self.prune_catchers(), self.prune_board()])
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -174,10 +190,19 @@ impl App {
                 self.reload_notes();
                 Task::none()
             }
-            Message::EscapePressed | Message::BackgroundPressed | Message::ClickCatcherPressed => {
-                self.exit_editing()
+            Message::EscapePressed => {
+                if self.board.is_some() {
+                    self.close_rescue_board()
+                } else {
+                    self.exit_editing()
+                }
             }
+            Message::BackgroundPressed | Message::ClickCatcherPressed => self.exit_editing(),
             Message::RefreshCatchers => self.refresh_catchers(),
+            Message::OpenRescueBoard(surface) => self.open_rescue_board(surface),
+            Message::CloseRescueBoard => self.close_rescue_board(),
+            Message::MoveNoteHere(id) => self.move_note_here(id),
+            Message::MoveAllHere(group) => self.move_all_here(group),
             Message::NewNote(surface) => self.new_note(surface),
             Message::Select(id) => self.select(id),
             Message::ToggleEdit(id) => self.toggle_edit(id),
@@ -214,6 +239,26 @@ impl App {
     }
 
     pub fn view(&self, id: SurfaceId) -> Element<'_, Message> {
+        if let Some(board) = &self.board
+            && board.surface_id == id
+        {
+            let groups: Vec<(String, Vec<&Note>)> = self
+                .orphan_groups()
+                .into_iter()
+                .map(|(name, ids)| {
+                    let notes = ids.iter().filter_map(|id| self.find_note(*id)).collect();
+                    (name, notes)
+                })
+                .collect();
+            let surface_size = board
+                .output_name
+                .as_deref()
+                .and_then(|name| self.outputs.entries.iter().find(|entry| entry.name == name))
+                .and_then(|entry| entry.logical_size)
+                .map(|(w, h)| (w as f32, h as f32));
+            return widgets::rescue_board(&groups, &self.palette, &self.config, surface_size);
+        }
+
         if self.catchers.iter().any(|catcher| catcher.surface_id == id) {
             return mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
                 .on_press(Message::ClickCatcherPressed)
@@ -256,6 +301,20 @@ impl App {
             stack = stack.push(pin(card).x(note.meta.x).y(note.meta.y));
         }
 
+        // Bottom-right button opening the rescue board, only when there are
+        // notes stranded on disconnected monitors.
+        let orphan_count: usize = self.orphan_groups().iter().map(|(_, ids)| ids.len()).sum();
+        if orphan_count > 0
+            && let Some((width, height)) = surface_size
+        {
+            let button = widgets::rescue_button(id, orphan_count, &self.palette);
+            stack = stack.push(
+                pin(button)
+                    .x((width as f32) - 88.0)
+                    .y((height as f32) - 52.0),
+            );
+        }
+
         stack.into()
     }
 
@@ -296,12 +355,32 @@ impl App {
         self.notes.iter_mut().find(|note| note.meta.id == id)
     }
 
+    /// The output a note should render on. Notes assigned to a disconnected
+    /// monitor are *not* rendered normally (they would land at meaningless
+    /// coordinates); they are surfaced through the rescue board instead.
     fn target_output(&self, note: &Note) -> Option<String> {
-        let primary = self.outputs.primary_name()?.to_owned();
         match note.meta.output.as_deref() {
             Some(name) if self.outputs.has_name(name) => Some(name.to_owned()),
-            _ => Some(primary),
+            Some(_) => None,
+            None => self.outputs.primary_name().map(str::to_owned),
         }
+    }
+
+    /// Notes grouped by disconnected monitor, in monitor-name order.
+    fn orphan_groups(&self) -> Vec<(String, Vec<Uuid>)> {
+        let mut groups: std::collections::BTreeMap<String, Vec<Uuid>> =
+            std::collections::BTreeMap::new();
+        for note in &self.notes {
+            if let Some(name) = note.meta.output.as_deref()
+                && !self.outputs.has_name(name)
+            {
+                groups
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(note.meta.id);
+            }
+        }
+        groups.into_iter().collect()
     }
 
     /// The output name of the surface backing the given window id, if it is one
@@ -498,6 +577,120 @@ impl App {
             return self.rebuild_catchers();
         }
         self.refresh_catchers()
+    }
+
+    // -- rescue board ------------------------------------------------------
+
+    fn board_settings(output: Option<OutputId>) -> LayerShellSettings {
+        LayerShellSettings {
+            anchor: Anchor::all(),
+            layer: Layer::Overlay,
+            exclusive_zone: 0,
+            keyboard_interactivity: KeyboardInteractivity::OnDemand,
+            size: Some((0, 0)),
+            margin: (0, 0, 0, 0),
+            namespace: BOARD_NAMESPACE.to_owned(),
+            output,
+        }
+    }
+
+    fn open_rescue_board(&mut self, surface: SurfaceId) -> Task<Message> {
+        if self.board.is_some() {
+            return Task::none();
+        }
+
+        let output_name = self
+            .output_name_for_window(window::Id::from(surface))
+            .or_else(|| self.outputs.primary_name().map(str::to_owned));
+        let output_id = output_name.as_deref().and_then(|name| {
+            self.outputs
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .and_then(|entry| entry.output_id)
+        });
+
+        let (surface_id, create) = new_layer_surface(Self::board_settings(output_id));
+        self.board = Some(BoardSurface {
+            surface_id,
+            output_name,
+        });
+
+        // Leave edit mode so the board isn't fighting the click catcher.
+        let exit = self.exit_editing();
+        Task::batch(vec![create, exit])
+    }
+
+    fn close_rescue_board(&mut self) -> Task<Message> {
+        match self.board.take() {
+            Some(board) => destroy_layer_surface(board.surface_id),
+            None => Task::none(),
+        }
+    }
+
+    fn prune_board(&mut self) -> Task<Message> {
+        let Some(board) = self.board.as_ref() else {
+            return Task::none();
+        };
+        let output_gone = board
+            .output_name
+            .as_deref()
+            .is_some_and(|name| !self.outputs.has_name(name));
+        if output_gone || self.orphan_groups().is_empty() {
+            self.close_rescue_board()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Cascade position for a note moved onto `target_name`.
+    fn cascade_position(&self, target_name: &str) -> (f32, f32) {
+        let count = self
+            .notes
+            .iter()
+            .filter(|note| note.meta.output.as_deref() == Some(target_name))
+            .count();
+        let (ow, oh) = self
+            .outputs
+            .entries
+            .iter()
+            .find(|entry| entry.name == target_name)
+            .and_then(|entry| entry.logical_size)
+            .map(|(w, h)| (w as f32, h as f32))
+            .unwrap_or((1920.0, 1080.0));
+
+        let offset = (count % 10) as f32 * 28.0;
+        let x = (80.0 + offset).min((ow - self.config.default_width).max(0.0));
+        let y = (80.0 + offset).min((oh - self.config.default_height).max(0.0));
+        (x, y)
+    }
+
+    fn move_note_here(&mut self, id: Uuid) -> Task<Message> {
+        let Some(target) = self.board.as_ref().and_then(|b| b.output_name.clone()) else {
+            return Task::none();
+        };
+        let (x, y) = self.cascade_position(&target);
+        if let Some(note) = self.find_note_mut(id) {
+            note.meta.output = Some(target);
+            note.meta.x = x;
+            note.meta.y = y;
+            note.dirty = true;
+        }
+        self.save_task(id)
+    }
+
+    fn move_all_here(&mut self, group: String) -> Task<Message> {
+        let ids: Vec<Uuid> = self
+            .notes
+            .iter()
+            .filter(|note| note.meta.output.as_deref() == Some(group.as_str()))
+            .map(|note| note.meta.id)
+            .collect();
+        Task::batch(
+            ids.into_iter()
+                .map(|id| self.move_note_here(id))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn select(&mut self, id: Uuid) -> Task<Message> {
