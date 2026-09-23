@@ -191,6 +191,7 @@ impl App {
             return Space::new().width(Length::Fill).height(Length::Fill).into();
         };
         let surface_name = entry.name.clone();
+        let surface_size = entry.logical_size;
 
         let mut stack = Stack::new().push(
             mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
@@ -202,6 +203,19 @@ impl App {
         for note in &self.notes {
             if self.target_output(note).as_deref() != Some(surface_name.as_str()) {
                 continue;
+            }
+            // While a note is dragged off the edge (cross-monitor drag) it can be
+            // fully outside the surface; skip it so we don't lay out a widget at
+            // an out-of-range position.
+            if let Some((width, height)) = surface_size {
+                let (width, height) = (width as f32, height as f32);
+                if note.meta.x >= width
+                    || note.meta.y >= height
+                    || note.meta.x + note.meta.width <= 0.0
+                    || note.meta.y + note.meta.height <= 0.0
+                {
+                    continue;
+                }
             }
             let selected = self.active == Some(note.meta.id);
             let card = widgets::note_card(note, id, selected, &self.config, &self.palette);
@@ -307,6 +321,18 @@ impl App {
         let target = self.target_output(note)?;
         let entry = self.outputs.entries.iter().find(|e| e.name == target)?;
         entry.logical_size.map(|(w, h)| (w as f32, h as f32))
+    }
+
+    /// Pull a note fully back inside its output, e.g. after a drag that was
+    /// released off-surface without transferring to another monitor.
+    fn clamp_note_into_bounds(&mut self, id: Uuid) {
+        let Some((ow, oh)) = self.output_bounds_for_note(id) else {
+            return;
+        };
+        if let Some(note) = self.find_note_mut(id) {
+            note.meta.x = note.meta.x.clamp(0.0, (ow - note.meta.width).max(0.0));
+            note.meta.y = note.meta.y.clamp(0.0, (oh - note.meta.height).max(0.0));
+        }
     }
 
     fn select(&mut self, id: Uuid) -> Task<Message> {
@@ -534,27 +560,15 @@ impl App {
             }
         }
 
+        // Follow the pointer exactly, even outside the surface, so the note
+        // visibly slides off the edge toward the neighbouring monitor.
         if let Some(drag) = self
             .drag
             .filter(|drag| drag.window == window && !drag.released)
+            && let Some(note) = self.find_note_mut(drag.note)
         {
-            let bounds = self.output_bounds_for_note(drag.note);
-            if let Some(note) = self.find_note_mut(drag.note) {
-                let mut x = drag.start_pos.x + (point.x - drag.start_cursor.x);
-                let mut y = drag.start_pos.y + (point.y - drag.start_cursor.y);
-                match bounds {
-                    Some((ow, oh)) => {
-                        x = x.clamp(0.0, (ow - note.meta.width).max(0.0));
-                        y = y.clamp(0.0, (oh - note.meta.height).max(0.0));
-                    }
-                    None => {
-                        x = x.max(0.0);
-                        y = y.max(0.0);
-                    }
-                }
-                note.meta.x = x;
-                note.meta.y = y;
-            }
+            note.meta.x = drag.start_pos.x + (point.x - drag.start_cursor.x);
+            note.meta.y = drag.start_pos.y + (point.y - drag.start_cursor.y);
         }
 
         if let Some(resize) = self.resize.filter(|resize| resize.window == window) {
@@ -680,6 +694,7 @@ impl App {
             }
             self.drag = None;
             self.pending_leave = None;
+            self.clamp_note_into_bounds(drag.note);
             return self.save_task(drag.note);
         }
         if let Some(resize) = self.resize.filter(|resize| resize.window == window) {
@@ -732,6 +747,7 @@ impl App {
                     note.meta.output = Some(name);
                 }
                 if let Some(drag) = self.drag.take() {
+                    self.clamp_note_into_bounds(drag.note);
                     return self.save_task(drag.note);
                 }
             }
@@ -747,6 +763,7 @@ impl App {
             }
 
             self.drag = None;
+            self.clamp_note_into_bounds(drag.note);
             return self.save_task(drag.note);
         }
 
