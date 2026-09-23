@@ -25,10 +25,10 @@ pub fn rescue_button<'a>(
 
     mouse_area(
         container(text(format!("\u{2193} {count}")).size(14).color(text_color))
-            .width(Length::Fixed(72.0))
-            .height(Length::Fixed(42.0))
-            .center_x(Length::Fixed(72.0))
-            .center_y(Length::Fixed(42.0))
+            .width(Length::Fixed(62.0))
+            .height(Length::Fixed(40.0))
+            .center_x(Length::Fixed(62.0))
+            .center_y(Length::Fixed(40.0))
             .style(move |_theme: &Theme| container::Style {
                 background: Some(background.into()),
                 border: Border {
