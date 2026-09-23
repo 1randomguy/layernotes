@@ -8,8 +8,9 @@ use uuid::Uuid;
 use iced::event::listen_with;
 use iced::widget::{Space, Stack, mouse_area, pin, text_editor};
 use iced::{
-    Element, Length, OutputEvent, Point, Size, Subscription, SurfaceId, Task, Theme, keyboard,
-    mouse, window,
+    Anchor, Element, InputRegionRect, KeyboardInteractivity, Layer, LayerShellSettings, Length,
+    OutputEvent, OutputId, Point, Size, Subscription, SurfaceId, Task, Theme,
+    destroy_layer_surface, keyboard, mouse, new_layer_surface, set_input_region, window,
 };
 
 use crate::config::{self, Config};
@@ -49,6 +50,20 @@ struct PendingLeave {
     token: u64,
 }
 
+/// A fullscreen overlay surface that catches clicks outside the note being
+/// edited, so clicking a window, the bar or another monitor leaves edit mode
+/// (like ashell's menus). On the edited note's monitor its input region is the
+/// complement of the note rectangle, so clicks on the note fall through to the
+/// editor on the Bottom-layer surface; on the other monitors it catches
+/// everything.
+#[derive(Debug, Clone, Copy)]
+struct Catcher {
+    surface_id: SurfaceId,
+    output: Option<OutputId>,
+}
+
+const CATCHER_NAMESPACE: &str = "layernotes-catcher";
+
 #[derive(Debug, Clone)]
 pub enum Message {
     OutputEvent(OutputEvent),
@@ -56,6 +71,8 @@ pub enum Message {
     NotesChanged,
     EscapePressed,
     BackgroundPressed,
+    ClickCatcherPressed,
+    RefreshCatchers,
     NewNote(SurfaceId),
     Select(Uuid),
     ToggleEdit(Uuid),
@@ -88,6 +105,7 @@ pub struct App {
     pending_leave: Option<PendingLeave>,
     leave_token: u64,
     last_config_error: Option<String>,
+    catchers: Vec<Catcher>,
 }
 
 impl App {
@@ -126,6 +144,7 @@ impl App {
                 pending_leave: None,
                 leave_token: 0,
                 last_config_error: None,
+                catchers: Vec::new(),
             },
             Task::none(),
         )
@@ -140,6 +159,11 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        Task::batch(vec![task, self.prune_catchers()])
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OutputEvent(event) => self.handle_output_event(event),
             Message::ConfigChanged => self.reload_config(),
@@ -147,7 +171,10 @@ impl App {
                 self.reload_notes();
                 Task::none()
             }
-            Message::EscapePressed | Message::BackgroundPressed => self.exit_editing(),
+            Message::EscapePressed | Message::BackgroundPressed | Message::ClickCatcherPressed => {
+                self.exit_editing()
+            }
+            Message::RefreshCatchers => self.refresh_catchers(),
             Message::NewNote(surface) => self.new_note(surface),
             Message::Select(id) => self.select(id),
             Message::ToggleEdit(id) => self.toggle_edit(id),
@@ -187,6 +214,13 @@ impl App {
     }
 
     pub fn view(&self, id: SurfaceId) -> Element<'_, Message> {
+        if self.catchers.iter().any(|catcher| catcher.surface_id == id) {
+            return mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                .on_press(Message::ClickCatcherPressed)
+                .on_right_press(Message::ClickCatcherPressed)
+                .into();
+        }
+
         let Some(entry) = self.outputs.get(id) else {
             return Space::new().width(Length::Fill).height(Length::Fill).into();
         };
@@ -335,6 +369,137 @@ impl App {
         }
     }
 
+    // -- click catchers ----------------------------------------------------
+
+    fn note_output_id(&self, id: Uuid) -> Option<OutputId> {
+        let note = self.find_note(id)?;
+        let target = self.target_output(note)?;
+        self.outputs
+            .entries
+            .iter()
+            .find(|entry| entry.name == target)
+            .and_then(|entry| entry.output_id)
+    }
+
+    fn editing_note(&self) -> Option<Uuid> {
+        self.notes
+            .iter()
+            .find(|note| note.editing)
+            .map(|note| note.meta.id)
+    }
+
+    fn output_logical_size(&self, output: Option<OutputId>) -> Option<(f32, f32)> {
+        self.outputs
+            .entries
+            .iter()
+            .find(|entry| entry.output_id == output)
+            .and_then(|entry| entry.logical_size)
+            .map(|(w, h)| (w as f32, h as f32))
+    }
+
+    /// The input region for a catcher on `output`: the whole output, except the
+    /// edited note's rectangle when the note lives on this output.
+    fn catcher_region(&self, output: Option<OutputId>) -> Vec<InputRegionRect> {
+        let Some((width, height)) = self.output_logical_size(output) else {
+            return Vec::new();
+        };
+        let Some(note_id) = self.editing_note() else {
+            return Vec::new();
+        };
+        let Some(note) = self.find_note(note_id) else {
+            return Vec::new();
+        };
+
+        if self.note_output_id(note_id) == output {
+            complement_region(
+                width,
+                height,
+                note.meta.x,
+                note.meta.y,
+                note.meta.width,
+                note.meta.height,
+            )
+        } else {
+            vec![InputRegionRect {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            }]
+        }
+    }
+
+    fn catcher_settings(output: Option<OutputId>) -> LayerShellSettings {
+        LayerShellSettings {
+            anchor: Anchor::all(),
+            layer: Layer::Overlay,
+            exclusive_zone: 0,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            size: Some((0, 0)),
+            margin: (0, 0, 0, 0),
+            namespace: CATCHER_NAMESPACE.to_owned(),
+            output,
+        }
+    }
+
+    /// Create a click catcher on every rendered monitor while a note is edited.
+    fn rebuild_catchers(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for catcher in self.catchers.drain(..) {
+            tasks.push(destroy_layer_surface(catcher.surface_id));
+        }
+
+        if self.editing_note().is_none() {
+            return Task::batch(tasks);
+        }
+
+        for entry in &self.outputs.entries {
+            let (surface_id, create) = new_layer_surface(Self::catcher_settings(entry.output_id));
+            self.catchers.push(Catcher {
+                surface_id,
+                output: entry.output_id,
+            });
+            tasks.push(create);
+        }
+
+        // The surfaces do not exist yet in this batch, so set their input
+        // regions on the next update (and again once the compositor maps them).
+        tasks.push(Task::done(Message::RefreshCatchers));
+        Task::batch(tasks)
+    }
+
+    fn refresh_catchers(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for catcher in &self.catchers {
+            let region = self.catcher_region(catcher.output);
+            tasks.push(set_input_region(catcher.surface_id, Some(region)));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Drop the catchers when no note is being edited.
+    fn prune_catchers(&mut self) -> Task<Message> {
+        if self.editing_note().is_some() || self.catchers.is_empty() {
+            return Task::none();
+        }
+        let mut tasks = Vec::new();
+        for catcher in self.catchers.drain(..) {
+            tasks.push(destroy_layer_surface(catcher.surface_id));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Keep the catchers in sync after the edited note moved or resized.
+    fn sync_catchers(&mut self) -> Task<Message> {
+        if self.editing_note().is_none() {
+            return self.prune_catchers();
+        }
+        if self.catchers.len() != self.outputs.entries.len() {
+            return self.rebuild_catchers();
+        }
+        self.refresh_catchers()
+    }
+
     fn select(&mut self, id: Uuid) -> Task<Message> {
         let mut tasks = Vec::new();
         let others: Vec<Uuid> = self
@@ -378,11 +543,15 @@ impl App {
         }
         self.active = Some(id);
         tasks.push(focus_editor(widgets::editor_id(id)));
+        tasks.push(self.rebuild_catchers());
         Task::batch(tasks)
     }
 
     fn exit_editing(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
+        for catcher in self.catchers.drain(..) {
+            tasks.push(destroy_layer_surface(catcher.surface_id));
+        }
         let editing: Vec<Uuid> = self
             .notes
             .iter()
@@ -423,6 +592,7 @@ impl App {
         Task::batch(vec![
             self.save_task(id),
             focus_editor(widgets::editor_id(id)),
+            self.rebuild_catchers(),
         ])
     }
 
@@ -695,35 +865,36 @@ impl App {
             self.drag = None;
             self.pending_leave = None;
             self.clamp_note_into_bounds(drag.note);
-            return self.save_task(drag.note);
+            let save = self.save_task(drag.note);
+            let sync = self.sync_catchers();
+            return Task::batch(vec![save, sync]);
         }
         if let Some(resize) = self.resize.filter(|resize| resize.window == window) {
             self.resize = None;
             self.pending_leave = None;
-            return self.save_task(resize.note);
+            let save = self.save_task(resize.note);
+            let sync = self.sync_catchers();
+            return Task::batch(vec![save, sync]);
         }
         Task::none()
     }
 
-    /// The pointer left this surface, so it is now over another surface (a
-    /// window, the bar, another monitor, ...). Leave editing mode, and give an
+    /// The pointer left this surface (another monitor, a window, ...). Give an
     /// in-flight drag a grace period to be picked up by another monitor before
-    /// treating it as dropped.
+    /// treating it as dropped. Unfocusing is click-driven now (click catcher).
     fn cursor_left(&mut self, window: window::Id) -> Task<Message> {
         if self.pointer_over == Some(window) {
             self.pointer_over = None;
         }
 
-        let mut tasks = vec![self.exit_editing()];
-
         let dragging = self.drag.is_some_and(|drag| drag.window == window)
             || self.resize.is_some_and(|resize| resize.window == window);
 
         if dragging {
-            tasks.push(self.start_leave_grace(window));
+            self.start_leave_grace(window)
+        } else {
+            Task::none()
         }
-
-        Task::batch(tasks)
     }
 
     fn confirm_leave(&mut self, token: u64) -> Task<Message> {
@@ -748,7 +919,9 @@ impl App {
                 }
                 if let Some(drag) = self.drag.take() {
                     self.clamp_note_into_bounds(drag.note);
-                    return self.save_task(drag.note);
+                    let save = self.save_task(drag.note);
+                    let sync = self.sync_catchers();
+                    return Task::batch(vec![save, sync]);
                 }
             }
 
@@ -764,7 +937,9 @@ impl App {
 
             self.drag = None;
             self.clamp_note_into_bounds(drag.note);
-            return self.save_task(drag.note);
+            let save = self.save_task(drag.note);
+            let sync = self.sync_catchers();
+            return Task::batch(vec![save, sync]);
         }
 
         if let Some(resize) = self.resize.filter(|resize| resize.window == pending.window) {
@@ -775,7 +950,9 @@ impl App {
                 return Task::none();
             }
             self.resize = None;
-            return self.save_task(resize.note);
+            let save = self.save_task(resize.note);
+            let sync = self.sync_catchers();
+            return Task::batch(vec![save, sync]);
         }
 
         Task::none()
@@ -861,16 +1038,31 @@ impl App {
                         note.meta.output = Some(name.clone());
                     }
                 }
-                task
+                let rebuild = self.rebuild_catchers();
+                Task::batch(vec![task, rebuild])
             }
             OutputEvent::InfoChanged(info) => {
                 self.outputs.set_logical_size(info.id, info.logical_size);
-                Task::none()
+                self.refresh_catchers()
             }
-            OutputEvent::Removed(id) => self.outputs.remove(id),
-            OutputEvent::SurfaceEnteredOutput { .. } | OutputEvent::SurfaceLeftOutput { .. } => {
-                Task::none()
+            OutputEvent::Removed(id) => {
+                let task = self.outputs.remove(id);
+                let rebuild = self.rebuild_catchers();
+                Task::batch(vec![task, rebuild])
             }
+            OutputEvent::SurfaceEnteredOutput { surface, .. } => {
+                // Once a catcher is mapped, (re)apply the input regions.
+                if self
+                    .catchers
+                    .iter()
+                    .any(|catcher| catcher.surface_id == surface)
+                {
+                    self.refresh_catchers()
+                } else {
+                    Task::none()
+                }
+            }
+            OutputEvent::SurfaceLeftOutput { .. } => Task::none(),
         }
     }
 
@@ -926,4 +1118,101 @@ fn sync_body_from_editor(note: &mut Note) {
 
 fn focus_editor<M: Send + 'static>(id: iced::widget::Id) -> Task<M> {
     iced_runtime::task::widget(iced::core::widget::operation::focusable::focus::<M>(id)).into()
+}
+
+/// Rectangles covering an `width`x`height` area minus the `(x, y, w, h)` hole.
+fn complement_region(
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> Vec<InputRegionRect> {
+    let nx = x.max(0.0).min(width);
+    let ny = y.max(0.0).min(height);
+    let nx2 = (x + w).clamp(nx, width);
+    let ny2 = (y + h).clamp(ny, height);
+
+    fn push(rects: &mut Vec<InputRegionRect>, x: f32, y: f32, w: f32, h: f32) {
+        if w > 0.0 && h > 0.0 {
+            rects.push(InputRegionRect {
+                x: x as i32,
+                y: y as i32,
+                width: w as i32,
+                height: h as i32,
+            });
+        }
+    }
+
+    let mut rects = Vec::new();
+    push(&mut rects, 0.0, 0.0, width, ny); // above the note
+    push(&mut rects, 0.0, ny2, width, height - ny2); // below the note
+    push(&mut rects, 0.0, ny, nx, ny2 - ny); // left of the note
+    push(&mut rects, nx2, ny, width - nx2, ny2 - ny); // right of the note
+    rects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complement_region_splits_around_hole() {
+        let rects = complement_region(100.0, 100.0, 20.0, 30.0, 40.0, 50.0);
+        assert_eq!(rects.len(), 4);
+        // Above and below span the full width.
+        assert_eq!(
+            rects[0],
+            InputRegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 30
+            }
+        );
+        assert_eq!(
+            rects[1],
+            InputRegionRect {
+                x: 0,
+                y: 80,
+                width: 100,
+                height: 20
+            }
+        );
+        // Left and right flank the hole.
+        assert_eq!(
+            rects[2],
+            InputRegionRect {
+                x: 0,
+                y: 30,
+                width: 20,
+                height: 50
+            }
+        );
+        assert_eq!(
+            rects[3],
+            InputRegionRect {
+                x: 60,
+                y: 30,
+                width: 40,
+                height: 50
+            }
+        );
+    }
+
+    #[test]
+    fn complement_region_full_hole_is_empty() {
+        let rects = complement_region(100.0, 100.0, 0.0, 0.0, 100.0, 100.0);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn complement_region_clamps_out_of_bounds_hole() {
+        let rects = complement_region(100.0, 100.0, 80.0, 90.0, 500.0, 500.0);
+        // Only the area above and to the left of the (clamped) hole remains.
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].height, 90); // above
+        assert_eq!(rects[1].width, 80); // left
+    }
 }

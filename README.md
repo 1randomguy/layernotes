@@ -117,8 +117,9 @@ cargo build --release
 ## Usage
 
 - **New note**: double-click empty desktop.
-- **Edit**: double-click a note. Double-click again, press `Esc`, click the
-  desktop, or move onto another window / the bar to go back to the preview.
+- **Edit**: double-click a note. Double-click again, press `Esc`, or click
+  anywhere outside the note (another note, a window, the bar, the desktop) to go
+  back to the preview.
 - **Move**: drag the note's header, including across monitors (release on the
   target monitor and the note is re-homed there).
 - **Resize**: drag the bottom-right corner.
@@ -145,7 +146,9 @@ src/
   compositors without desktop icons).
 - The keyboard is requested on demand; if a compositor refuses keyboard focus to
   bottom-layer surfaces, editing will not receive input.
-- Unfocus is driven by the pointer leaving the surface. Moving the pointer onto
-  another window or the bar ends editing, which is also how a click on them is
-  detected (the backend exposes no keyboard-focus events).
+- Click-away uses temporary fullscreen overlays ("click catchers") on every
+  rendered monitor. On the edited note's monitor the input region excludes the
+  note (so the editor still works); elsewhere it catches everything. It is
+  modal: the click that leaves edit mode is consumed rather than passed to the
+  window underneath (same behaviour as ashell's menus).
 - Per-note `color` is honoured when rendering but there is no colour picker yet.
