@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod geometry;
 mod note;
 mod outputs;
 mod store;

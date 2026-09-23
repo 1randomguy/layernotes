@@ -14,6 +14,7 @@ use iced::{
 };
 
 use crate::config::{self, Config};
+use crate::geometry::{self, OutputRect};
 use crate::note::Note;
 use crate::outputs::Outputs;
 use crate::store;
@@ -106,6 +107,7 @@ pub struct App {
     leave_token: u64,
     last_config_error: Option<String>,
     catchers: Vec<Catcher>,
+    output_geometries: HashMap<String, OutputRect>,
 }
 
 impl App {
@@ -145,6 +147,7 @@ impl App {
                 leave_token: 0,
                 last_config_error: None,
                 catchers: Vec::new(),
+                output_geometries: geometry::enumerate(),
             },
             Task::none(),
         )
@@ -194,10 +197,7 @@ impl App {
             }
             Message::CursorMoved(window, point) => self.cursor_moved(window, point),
             Message::CursorReleased(window) => self.cursor_released(window),
-            Message::CursorEntered(window) => {
-                self.cursor_entered(window);
-                Task::none()
-            }
+            Message::CursorEntered(window) => self.cursor_entered(window),
             Message::CursorLeft(window) => self.cursor_left(window),
             Message::ConfirmLeave(token) => self.confirm_leave(token),
             Message::SaveNote(id) => self.save_task(id),
@@ -722,7 +722,10 @@ impl App {
                 // as it lands on the new monitor.
                 if let Some(drag) = self.drag.filter(|drag| drag.released) {
                     self.drag = None;
-                    return self.save_task(drag.note);
+                    self.pending_leave = None;
+                    let save = self.save_task(drag.note);
+                    let sync = self.sync_catchers();
+                    return Task::batch(vec![save, sync]);
                 }
             }
             if self.resize.is_some_and(|resize| resize.window != window) {
@@ -760,15 +763,27 @@ impl App {
         Task::none()
     }
 
-    fn cursor_entered(&mut self, window: window::Id) {
+    fn cursor_entered(&mut self, window: window::Id) -> Task<Message> {
         self.pointer_over = Some(window);
+        // Forget any stale position for this surface; a fresh motion will set it.
+        self.cursor.remove(&window);
 
-        // Entering any of our surfaces keeps a cross-monitor drag alive.
-        if self.output_name_for_window(window).is_some()
-            && (self.drag.is_some() || self.resize.is_some())
-        {
+        if self.output_name_for_window(window).is_none() {
+            return Task::none();
+        }
+
+        // A drag/resize that started elsewhere keeps a grace period running, so a
+        // fresh motion can re-home it, otherwise it is finalized geometrically.
+        if let Some(drag) = self.drag.filter(|drag| drag.window != window) {
+            return self.start_leave_grace(drag.window);
+        }
+        if let Some(resize) = self.resize.filter(|resize| resize.window != window) {
+            return self.start_leave_grace(resize.window);
+        }
+        if self.drag.is_some() || self.resize.is_some() {
             self.pending_leave = None;
         }
+        Task::none()
     }
 
     /// Re-home an in-flight drag onto another of our surfaces, preserving the
@@ -783,20 +798,7 @@ impl App {
         let grab_y = drag.start_cursor.y - drag.start_pos.y;
         let start_pos = Point::new(point.x - grab_x, point.y - grab_y);
 
-        let bounds = self.output_size_for_window(window);
-        if let Some(name) = self.output_name_for_window(window)
-            && let Some(note) = self.find_note_mut(drag.note)
-        {
-            note.meta.output = Some(name);
-            let mut x = start_pos.x.max(0.0);
-            let mut y = start_pos.y.max(0.0);
-            if let Some((ow, oh)) = bounds {
-                x = x.clamp(0.0, (ow - note.meta.width).max(0.0));
-                y = y.clamp(0.0, (oh - note.meta.height).max(0.0));
-            }
-            note.meta.x = x;
-            note.meta.y = y;
-        }
+        self.place_note(drag.note, window, start_pos);
 
         self.drag = Some(Drag {
             window,
@@ -805,6 +807,162 @@ impl App {
             start_pos,
             released: drag.released,
         });
+    }
+
+    /// Move a note to `window`'s output at the given logical position, clamped
+    /// to that output.
+    fn place_note(&mut self, note_id: Uuid, window: window::Id, position: Point) {
+        let name = self.output_name_for_window(window);
+        let bounds = self.output_size_for_window(window);
+        if let Some(note) = self.find_note_mut(note_id) {
+            if let Some(name) = name {
+                note.meta.output = Some(name);
+            }
+            let mut x = position.x;
+            let mut y = position.y;
+            if let Some((ow, oh)) = bounds {
+                x = x.clamp(0.0, (ow - note.meta.width).max(0.0));
+                y = y.clamp(0.0, (oh - note.meta.height).max(0.0));
+            } else {
+                x = x.max(0.0);
+                y = y.max(0.0);
+            }
+            note.meta.x = x;
+            note.meta.y = y;
+        }
+    }
+
+    /// Approximate the note's position on `target` from its position on
+    /// `source`, mirroring how far it crossed the shared edge. Used when no
+    /// fresh pointer position is available on the target monitor.
+    fn geometric_position(
+        &self,
+        note_id: Uuid,
+        source: window::Id,
+        target: window::Id,
+    ) -> Option<Point> {
+        let note = self.find_note(note_id)?;
+        let src = self.output_size_for_window(source)?;
+        let dst = self.output_size_for_window(target)?;
+        let (x, y) = map_across_edges(
+            src,
+            dst,
+            (note.meta.x, note.meta.y, note.meta.width, note.meta.height),
+        )?;
+        Some(Point::new(x, y))
+    }
+
+    /// Precise position of a note on `target_window` using the cached output
+    /// layout, or `None` if the layout is unavailable.
+    fn geometry_position_for(
+        &self,
+        note_id: Uuid,
+        source_window: window::Id,
+        target_window: window::Id,
+    ) -> Option<Point> {
+        let source_name = self.output_name_for_window(source_window)?;
+        let target_name = self.output_name_for_window(target_window)?;
+        let source_rect = *self.output_geometries.get(&source_name)?;
+        let target_rect = *self.output_geometries.get(&target_name)?;
+        let note = self.find_note(note_id)?;
+        Some(Point::new(
+            source_rect.x as f32 + note.meta.x - target_rect.x as f32,
+            source_rect.y as f32 + note.meta.y - target_rect.y as f32,
+        ))
+    }
+
+    /// Finish a released drag on `target`, preferring a fresh pointer position
+    /// and falling back to a geometric mapping.
+    fn finalize_drag_on(&mut self, target: window::Id, drag: Drag) -> Task<Message> {
+        let position = match self.cursor.get(&target).copied() {
+            Some(point) => {
+                let grab_x = drag.start_cursor.x - drag.start_pos.x;
+                let grab_y = drag.start_cursor.y - drag.start_pos.y;
+                Some(Point::new(point.x - grab_x, point.y - grab_y))
+            }
+            None => self
+                .geometry_position_for(drag.note, drag.window, target)
+                .or_else(|| self.geometric_position(drag.note, drag.window, target)),
+        };
+
+        if let Some(position) = position {
+            self.place_note(drag.note, target, position);
+        } else if let Some(name) = self.output_name_for_window(target) {
+            if let Some(note) = self.find_note_mut(drag.note) {
+                note.meta.output = Some(name);
+            }
+            self.clamp_note_into_bounds(drag.note);
+        }
+
+        self.drag = None;
+        self.pending_leave = None;
+        let save = self.save_task(drag.note);
+        let sync = self.sync_catchers();
+        Task::batch(vec![save, sync])
+    }
+
+    /// Transfer a drag released outside its surface to whichever output the
+    /// pointer is over, using the cached output layout. This does not depend on
+    /// the compositor sending `enter`/motion on the target monitor (which it may
+    /// only do once the pointer moves again). Returns `None` if the layout is
+    /// unknown or the pointer is not over another rendered output.
+    fn try_geometry_transfer(&mut self, window: window::Id, drag: Drag) -> Option<Task<Message>> {
+        // Some compositors report every output at the same origin; if so the
+        // layout is unusable and we fall back to enter/motion.
+        let origins: std::collections::HashSet<(i32, i32)> = self
+            .output_geometries
+            .values()
+            .map(|rect| (rect.x, rect.y))
+            .collect();
+        if self.output_geometries.len() > 1 && origins.len() < 2 {
+            return None;
+        }
+
+        let source_name = self.output_name_for_window(window)?;
+        let source_rect = *self.output_geometries.get(&source_name)?;
+        let cursor = self.cursor.get(&window).copied()?;
+        let global_x = source_rect.x as f32 + cursor.x;
+        let global_y = source_rect.y as f32 + cursor.y;
+
+        let has_name = |name: &str| self.outputs.has_name(name);
+        let (target_name, target_rect) = self
+            .output_geometries
+            .iter()
+            .find(|(name, rect)| {
+                name.as_str() != source_name.as_str()
+                    && has_name(name)
+                    && rect.contains(global_x, global_y)
+            })
+            .map(|(name, rect)| (name.clone(), *rect))?;
+
+        let target_size = self
+            .outputs
+            .entries
+            .iter()
+            .find(|entry| entry.name == target_name)
+            .and_then(|entry| entry.logical_size)
+            .map(|(w, h)| (w as f32, h as f32))
+            .unwrap_or((target_rect.width as f32, target_rect.height as f32));
+
+        let note = self.find_note(drag.note)?;
+        let local_x = source_rect.x as f32 + note.meta.x - target_rect.x as f32;
+        let local_y = source_rect.y as f32 + note.meta.y - target_rect.y as f32;
+
+        if let Some(note) = self.find_note_mut(drag.note) {
+            note.meta.output = Some(target_name);
+            note.meta.x = local_x.clamp(0.0, (target_size.0 - note.meta.width).max(0.0));
+            note.meta.y = local_y.clamp(0.0, (target_size.1 - note.meta.height).max(0.0));
+        }
+
+        self.drag = None;
+        self.pending_leave = None;
+        let save = self.save_task(drag.note);
+        let sync = self.sync_catchers();
+        Some(Task::batch(vec![save, sync]))
+    }
+
+    fn refresh_output_geometries(&mut self) {
+        self.output_geometries = geometry::enumerate();
     }
 
     fn retarget_resize(&mut self, window: window::Id, point: Point) {
@@ -828,34 +986,36 @@ impl App {
     }
 
     fn cursor_released(&mut self, window: window::Id) -> Task<Message> {
-        // Releasing on a different surface transfers the drag there first.
+        // Releasing on a different surface transfers the drag/resize there.
         if self.output_name_for_window(window).is_some() {
-            if self.drag.is_some_and(|drag| drag.window != window) {
-                let point = self.cursor.get(&window).copied();
-                if let Some(point) = point {
-                    self.retarget_drag(window, point);
-                } else if let Some(name) = self.output_name_for_window(window)
-                    && let Some(drag) = self.drag
-                    && let Some(note) = self.find_note_mut(drag.note)
+            if let Some(drag) = self.drag.filter(|drag| drag.window != window) {
+                return self.finalize_drag_on(window, drag);
+            }
+            if let Some(resize) = self.resize.filter(|resize| resize.window != window) {
+                if let Some(name) = self.output_name_for_window(window)
+                    && let Some(note) = self.find_note_mut(resize.note)
                 {
                     note.meta.output = Some(name);
                 }
-            }
-            if self.resize.is_some_and(|resize| resize.window != window)
-                && let Some(name) = self.output_name_for_window(window)
-                && let Some(resize) = self.resize
-                && let Some(note) = self.find_note_mut(resize.note)
-            {
-                note.meta.output = Some(name);
+                self.clamp_note_into_bounds(resize.note);
+                self.resize = None;
+                self.pending_leave = None;
+                let save = self.save_task(resize.note);
+                let sync = self.sync_catchers();
+                return Task::batch(vec![save, sync]);
             }
         }
 
         if let Some(drag) = self.drag.filter(|drag| drag.window == window) {
             // Wayland keeps an implicit pointer grab while a button is held, so
             // the pointer can be on another monitor while we only see
-            // out-of-bounds coordinates. Keep the drag alive until the pointer
-            // is picked up there (or the grace period expires).
+            // out-of-bounds coordinates. Resolve the target from the output
+            // layout if we can, so a release without further motion still moves
+            // the note; otherwise wait for the target's enter/motion.
             if self.pointer_outside_window(window) {
+                if let Some(task) = self.try_geometry_transfer(window, drag) {
+                    return task;
+                }
                 self.drag = Some(Drag {
                     released: true,
                     ..drag
@@ -905,24 +1065,13 @@ impl App {
 
         if let Some(drag) = self.drag.filter(|drag| drag.window == pending.window) {
             // A released drag that landed on another of our surfaces finishes
-            // there, at the pointer's position.
+            // there (with a fresh pointer position if we got one, otherwise a
+            // geometric mapping).
             if drag.released
                 && let Some(over) = self.pointer_over.filter(|over| *over != pending.window)
                 && self.output_name_for_window(over).is_some()
             {
-                if let Some(point) = self.cursor.get(&over).copied() {
-                    self.retarget_drag(over, point);
-                } else if let Some(name) = self.output_name_for_window(over)
-                    && let Some(note) = self.find_note_mut(drag.note)
-                {
-                    note.meta.output = Some(name);
-                }
-                if let Some(drag) = self.drag.take() {
-                    self.clamp_note_into_bounds(drag.note);
-                    let save = self.save_task(drag.note);
-                    let sync = self.sync_catchers();
-                    return Task::batch(vec![save, sync]);
-                }
+                return self.finalize_drag_on(over, drag);
             }
 
             // Otherwise, while the pointer is still on one of our surfaces, let
@@ -1038,15 +1187,18 @@ impl App {
                         note.meta.output = Some(name.clone());
                     }
                 }
+                self.refresh_output_geometries();
                 let rebuild = self.rebuild_catchers();
                 Task::batch(vec![task, rebuild])
             }
             OutputEvent::InfoChanged(info) => {
                 self.outputs.set_logical_size(info.id, info.logical_size);
+                self.refresh_output_geometries();
                 self.refresh_catchers()
             }
             OutputEvent::Removed(id) => {
                 let task = self.outputs.remove(id);
+                self.refresh_output_geometries();
                 let rebuild = self.rebuild_catchers();
                 Task::batch(vec![task, rebuild])
             }
@@ -1153,6 +1305,44 @@ fn complement_region(
     rects
 }
 
+/// Map a `(x, y, w, h)` rectangle from a `src`-sized output onto a `dst`-sized
+/// neighbour by mirroring how far it crossed the shared edge (the axis with the
+/// largest overflow). Returns `None` if the rectangle is fully inside `src`.
+fn map_across_edges(
+    src: (f32, f32),
+    dst: (f32, f32),
+    rect: (f32, f32, f32, f32),
+) -> Option<(f32, f32)> {
+    let (sw, sh) = src;
+    let (tw, th) = dst;
+    let (x, y, w, h) = rect;
+
+    let right = x + w - sw;
+    let left = -x;
+    let bottom = y + h - sh;
+    let top = -y;
+    let max = right.max(left).max(bottom).max(top);
+    if max <= 0.0 {
+        return None;
+    }
+
+    let (mut nx, mut ny) = (x, y);
+    if right >= max {
+        nx = x - sw;
+    } else if left >= max {
+        nx = x + tw;
+    } else if bottom >= max {
+        ny = y - sh;
+    } else {
+        ny = y + th;
+    }
+
+    Some((
+        nx.clamp(0.0, (tw - w).max(0.0)),
+        ny.clamp(0.0, (th - h).max(0.0)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,5 +1404,51 @@ mod tests {
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].height, 90); // above
         assert_eq!(rects[1].width, 80); // left
+    }
+
+    #[test]
+    fn map_across_edges_inside_is_none() {
+        assert_eq!(
+            map_across_edges(
+                (1920.0, 1080.0),
+                (2560.0, 1440.0),
+                (100.0, 100.0, 260.0, 220.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn map_across_edges_mirrors_right_crossing() {
+        // Note's right edge is 140px past the source's right edge.
+        let mapped = map_across_edges(
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (1800.0, 100.0, 260.0, 220.0),
+        );
+        // x is clamped to the destination's left edge, y is preserved.
+        assert_eq!(mapped, Some((0.0, 100.0)));
+    }
+
+    #[test]
+    fn map_across_edges_mirrors_left_crossing() {
+        // Note crossed the source's left edge by 120px; destination is to the
+        // left, so it lands at the destination's right edge.
+        let mapped = map_across_edges(
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (-120.0, 100.0, 260.0, 220.0),
+        );
+        assert_eq!(mapped, Some((2300.0, 100.0)));
+    }
+
+    #[test]
+    fn map_across_edges_mirrors_bottom_crossing() {
+        let mapped = map_across_edges(
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (100.0, 1000.0, 260.0, 220.0),
+        );
+        assert_eq!(mapped, Some((100.0, 0.0)));
     }
 }

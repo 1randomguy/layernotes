@@ -1292,6 +1292,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "wayland-client",
 ]
 
 [[package]]
