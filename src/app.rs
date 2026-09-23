@@ -30,6 +30,9 @@ struct Drag {
     note: Uuid,
     start_cursor: Point,
     start_pos: Point,
+    /// The button was released while the pointer was outside the surface (i.e.
+    /// on another monitor); the drag is waiting to be picked up there.
+    released: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +87,7 @@ pub struct App {
     save_handles: HashMap<Uuid, iced::task::Handle>,
     pending_leave: Option<PendingLeave>,
     leave_token: u64,
+    last_config_error: Option<String>,
 }
 
 impl App {
@@ -121,6 +125,7 @@ impl App {
                 save_handles: HashMap::new(),
                 pending_leave: None,
                 leave_token: 0,
+                last_config_error: None,
             },
             Task::none(),
         )
@@ -160,10 +165,7 @@ impl App {
                 self.open_link(&url);
                 Task::none()
             }
-            Message::CursorMoved(window, point) => {
-                self.cursor_moved(window, point);
-                Task::none()
-            }
+            Message::CursorMoved(window, point) => self.cursor_moved(window, point),
             Message::CursorReleased(window) => self.cursor_released(window),
             Message::CursorEntered(window) => {
                 self.cursor_entered(window);
@@ -262,6 +264,42 @@ impl App {
             .iter()
             .find(|entry| window::Id::from(entry.surface_id) == window)
             .map(|entry| entry.name.clone())
+    }
+
+    /// The logical size of the output backing the given window id, if known.
+    fn output_size_for_window(&self, window: window::Id) -> Option<(f32, f32)> {
+        self.outputs
+            .entries
+            .iter()
+            .find(|entry| window::Id::from(entry.surface_id) == window)
+            .and_then(|entry| entry.logical_size)
+            .map(|(w, h)| (w as f32, h as f32))
+    }
+
+    /// Whether the last known cursor position on this surface is outside it,
+    /// which (during an implicit grab) means the pointer is on another monitor.
+    fn pointer_outside_window(&self, window: window::Id) -> bool {
+        let Some(point) = self.cursor.get(&window).copied() else {
+            return false;
+        };
+        let Some((width, height)) = self.output_size_for_window(window) else {
+            return false;
+        };
+        point.x < 0.0 || point.y < 0.0 || point.x > width || point.y > height
+    }
+
+    /// Start (or restart) the grace period after which a drag that left a
+    /// surface is considered dropped.
+    fn start_leave_grace(&mut self, window: window::Id) -> Task<Message> {
+        self.leave_token += 1;
+        let token = self.leave_token;
+        self.pending_leave = Some(PendingLeave { window, token });
+        Task::perform(
+            async move {
+                tokio::time::sleep(LEAVE_GRACE).await;
+            },
+            move |()| Message::ConfirmLeave(token),
+        )
     }
 
     fn output_bounds_for_note(&self, id: Uuid) -> Option<(f32, f32)> {
@@ -446,6 +484,7 @@ impl App {
             note: id,
             start_cursor,
             start_pos,
+            released: false,
         });
     }
 
@@ -472,7 +511,7 @@ impl App {
         });
     }
 
-    fn cursor_moved(&mut self, window: window::Id, point: Point) {
+    fn cursor_moved(&mut self, window: window::Id, point: Point) -> Task<Message> {
         self.cursor.insert(window, point);
 
         // Hand an in-flight drag/resize over to this surface if it started on a
@@ -483,13 +522,22 @@ impl App {
             }
             if self.drag.is_some_and(|drag| drag.window != window) {
                 self.retarget_drag(window, point);
+                // A drag whose button was already released is finished as soon
+                // as it lands on the new monitor.
+                if let Some(drag) = self.drag.filter(|drag| drag.released) {
+                    self.drag = None;
+                    return self.save_task(drag.note);
+                }
             }
             if self.resize.is_some_and(|resize| resize.window != window) {
                 self.retarget_resize(window, point);
             }
         }
 
-        if let Some(drag) = self.drag.filter(|drag| drag.window == window) {
+        if let Some(drag) = self
+            .drag
+            .filter(|drag| drag.window == window && !drag.released)
+        {
             let bounds = self.output_bounds_for_note(drag.note);
             if let Some(note) = self.find_note_mut(drag.note) {
                 let mut x = drag.start_pos.x + (point.x - drag.start_cursor.x);
@@ -524,6 +572,8 @@ impl App {
                 note.meta.height = height;
             }
         }
+
+        Task::none()
     }
 
     fn cursor_entered(&mut self, window: window::Id) {
@@ -549,12 +599,19 @@ impl App {
         let grab_y = drag.start_cursor.y - drag.start_pos.y;
         let start_pos = Point::new(point.x - grab_x, point.y - grab_y);
 
+        let bounds = self.output_size_for_window(window);
         if let Some(name) = self.output_name_for_window(window)
             && let Some(note) = self.find_note_mut(drag.note)
         {
             note.meta.output = Some(name);
-            note.meta.x = start_pos.x.max(0.0);
-            note.meta.y = start_pos.y.max(0.0);
+            let mut x = start_pos.x.max(0.0);
+            let mut y = start_pos.y.max(0.0);
+            if let Some((ow, oh)) = bounds {
+                x = x.clamp(0.0, (ow - note.meta.width).max(0.0));
+                y = y.clamp(0.0, (oh - note.meta.height).max(0.0));
+            }
+            note.meta.x = x;
+            note.meta.y = y;
         }
 
         self.drag = Some(Drag {
@@ -562,6 +619,7 @@ impl App {
             note: drag.note,
             start_cursor: point,
             start_pos,
+            released: drag.released,
         });
     }
 
@@ -609,6 +667,17 @@ impl App {
         }
 
         if let Some(drag) = self.drag.filter(|drag| drag.window == window) {
+            // Wayland keeps an implicit pointer grab while a button is held, so
+            // the pointer can be on another monitor while we only see
+            // out-of-bounds coordinates. Keep the drag alive until the pointer
+            // is picked up there (or the grace period expires).
+            if self.pointer_outside_window(window) {
+                self.drag = Some(Drag {
+                    released: true,
+                    ..drag
+                });
+                return self.start_leave_grace(window);
+            }
             self.drag = None;
             self.pending_leave = None;
             return self.save_task(drag.note);
@@ -636,15 +705,7 @@ impl App {
             || self.resize.is_some_and(|resize| resize.window == window);
 
         if dragging {
-            self.leave_token += 1;
-            let token = self.leave_token;
-            self.pending_leave = Some(PendingLeave { window, token });
-            tasks.push(Task::perform(
-                async move {
-                    tokio::time::sleep(LEAVE_GRACE).await;
-                },
-                move |()| Message::ConfirmLeave(token),
-            ));
+            tasks.push(self.start_leave_grace(window));
         }
 
         Task::batch(tasks)
@@ -656,23 +717,50 @@ impl App {
         };
         self.pending_leave = None;
 
-        // The pointer is still on one of our surfaces (likely another monitor),
-        // so the drag lives on until it moves or is released there.
-        if let Some(over) = self.pointer_over
-            && over != pending.window
-            && self.output_name_for_window(over).is_some()
-        {
-            return Task::none();
-        }
-
         if let Some(drag) = self.drag.filter(|drag| drag.window == pending.window) {
+            // A released drag that landed on another of our surfaces finishes
+            // there, at the pointer's position.
+            if drag.released
+                && let Some(over) = self.pointer_over.filter(|over| *over != pending.window)
+                && self.output_name_for_window(over).is_some()
+            {
+                if let Some(point) = self.cursor.get(&over).copied() {
+                    self.retarget_drag(over, point);
+                } else if let Some(name) = self.output_name_for_window(over)
+                    && let Some(note) = self.find_note_mut(drag.note)
+                {
+                    note.meta.output = Some(name);
+                }
+                if let Some(drag) = self.drag.take() {
+                    return self.save_task(drag.note);
+                }
+            }
+
+            // Otherwise, while the pointer is still on one of our surfaces, let
+            // the drag continue until it moves or is released there.
+            if !drag.released
+                && let Some(over) = self.pointer_over
+                && over != pending.window
+                && self.output_name_for_window(over).is_some()
+            {
+                return Task::none();
+            }
+
             self.drag = None;
             return self.save_task(drag.note);
         }
+
         if let Some(resize) = self.resize.filter(|resize| resize.window == pending.window) {
+            if let Some(over) = self.pointer_over
+                && over != pending.window
+                && self.output_name_for_window(over).is_some()
+            {
+                return Task::none();
+            }
             self.resize = None;
             return self.save_task(resize.note);
         }
+
         Task::none()
     }
 
@@ -772,6 +860,7 @@ impl App {
     fn reload_config(&mut self) -> Task<Message> {
         match config::read_config(&self.config_path) {
             Ok(new_config) => {
+                self.last_config_error = None;
                 let notes_dir_changed = new_config.notes_path() != self.config.notes_path();
                 let layer_changed = new_config.layer != self.config.layer;
                 self.config = new_config;
@@ -789,7 +878,13 @@ impl App {
                 Task::batch(tasks)
             }
             Err(e) => {
-                log::warn!("Failed to reload config: {e}");
+                // Report the full error chain, but only once per distinct
+                // failure so a missing/locked file doesn't spam the log.
+                let message = format!("{e:#}");
+                if self.last_config_error.as_deref() != Some(message.as_str()) {
+                    log::warn!("Failed to reload config: {message}");
+                    self.last_config_error = Some(message);
+                }
                 Task::none()
             }
         }

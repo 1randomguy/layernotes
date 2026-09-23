@@ -15,8 +15,9 @@ backend for iced 0.14, and the Elm architecture.
 
 - One layer-shell surface per output on the `Bottom` layer (configurable layer).
 - Markdown notes rendered with iced's built-in markdown widget.
-- Double-click a note (or its header button) to edit the raw markdown in a
-  syntax-highlighted `text_editor`; toggle back for the rendered preview.
+- Double-click a note to edit the raw markdown in a syntax-highlighted
+  `text_editor`; double-click again (or press `Esc`/click away) for the rendered
+  preview.
 - Drag notes by their header; resize from the bottom-right handle. Position and
   size are persisted to the file's frontmatter, and notes can be dragged from
   one monitor to another.
@@ -28,7 +29,8 @@ backend for iced 0.14, and the Elm architecture.
 - Theming via the built-in [Catppuccin](https://catppuccin.com) palettes
   (Mocha by default), with Macchiato, Frappe, Latte, Dark and Light available.
   Notes use the palette's dark `base` with `text` and a `mauve` focus ring; the
-  selected theme drives the header, borders, selection ring and editor colours.
+  header follows each note's own colour, and the theme drives borders, the
+  selection ring and editor colours.
 
 ## Note format
 
@@ -115,11 +117,10 @@ cargo build --release
 ## Usage
 
 - **New note**: double-click empty desktop.
-- **Edit**: double-click a note, or click `edit` in its header. Click `done`,
-  press `Esc`, click the desktop, or move onto another window / the bar to go
-  back to the preview.
-- **Move**: drag the note's header, including across monitors (the note is
-  re-homed to the monitor it is dropped on).
+- **Edit**: double-click a note. Double-click again, press `Esc`, click the
+  desktop, or move onto another window / the bar to go back to the preview.
+- **Move**: drag the note's header, including across monitors (release on the
+  target monitor and the note is re-homed there).
 - **Resize**: drag the bottom-right corner.
 - **Delete**: click `x`, then `sure?` to confirm.
 

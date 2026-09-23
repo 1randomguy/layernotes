@@ -38,26 +38,20 @@ pub fn note_card<'a>(
     let accent = palette.accent;
     let border_color = palette.border;
     let shadow_color = palette.shadow;
-    let header_bg = palette.button_bg;
+    // The header follows the note's own colour rather than the theme, so a
+    // yellow note keeps a yellow (slightly shaded) bar with dark text.
+    let header_bg = theme::shade(background);
+    let border_width = 2.0;
 
     let header = mouse_area(
         container(
             iced::widget::row(vec![
-                text("\u{2261}")
-                    .size(16)
-                    .color(text_color.scale_alpha(0.65))
-                    .into(),
                 text(note.display_title())
                     .size((font_size - 2.0).max(10.0))
                     .color(text_color)
                     .width(Length::Fill)
                     .wrapping(text::Wrapping::Word)
                     .into(),
-                icon_button(
-                    if note.editing { "done" } else { "edit" },
-                    Message::ToggleEdit(id),
-                    text_color,
-                ),
                 icon_button(
                     if note.confirm_delete { "sure?" } else { "x" },
                     Message::DeleteNote(id),
@@ -76,8 +70,8 @@ pub fn note_card<'a>(
             background: Some(header_bg.into()),
             border: Border {
                 radius: iced::border::Radius {
-                    top_left: 9.0,
-                    top_right: 9.0,
+                    top_left: 8.0,
+                    top_right: 8.0,
                     ..Default::default()
                 },
                 ..Border::default()
@@ -126,11 +120,12 @@ pub fn note_card<'a>(
     let card = container(iced::widget::column(vec![header.into(), body]).spacing(0))
         .width(Length::Fixed(note.meta.width))
         .height(Length::Fixed(note.meta.height))
+        .padding(border_width)
         .style(move |_theme: &Theme| container::Style {
             background: Some(background.into()),
             border: Border {
                 color: if selected { accent } else { border_color },
-                width: if selected { 2.0 } else { 1.0 },
+                width: border_width,
                 radius: 10.0.into(),
             },
             shadow: Shadow {

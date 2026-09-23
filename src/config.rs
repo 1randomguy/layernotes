@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use inotify::{Inotify, WatchMask};
@@ -11,6 +12,10 @@ use iced::stream;
 use crate::xdg;
 
 pub const DEFAULT_CONFIG_FILE_PATH: &str = "~/.config/layernotes/config.toml";
+
+/// How long to wait for the config file to stop changing before reloading it.
+/// Coalesces the delete/rename burst of an atomic save into a single reload.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -247,10 +252,57 @@ pub fn subscription(path: &Path) -> Subscription<()> {
                         .is_some_and(|name| name.to_string_lossy() == file_name.to_string_lossy())
                 });
 
-                if relevant && output.send(()).await.is_err() {
+                if !relevant {
+                    continue;
+                }
+
+                // Wait until the file stops changing so we read a complete
+                // write instead of racing an editor's atomic save.
+                while let Ok(Some(_)) = tokio::time::timeout(WATCH_DEBOUNCE, events.next()).await {}
+
+                if output.send(()).await.is_err() {
                     break;
                 }
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+log_level = "warn"
+notes_dir = "/home/bene/.local/share/layernotes/notes"
+outputs = "All"
+layer = "Bottom"
+font_size = 15.0
+scale_factor = 1.0
+default_width = 260.0
+default_height = 220.0
+autosave_debounce_ms = 500
+theme = "CatppuccinMocha"
+
+[markdown]
+h1_scale = 1.3
+h2_scale = 1.2
+h3_scale = 1.1
+h4_scale = 1.0
+h5_scale = 1.0
+h6_scale = 1.0
+code_scale = 0.8
+spacing_scale = 0.65
+"#;
+
+    #[test]
+    fn parses_sample_config() {
+        let config: Config = toml::from_str(SAMPLE).expect("sample config should parse");
+        assert_eq!(config.theme, Theme::CatppuccinMocha);
+        assert_eq!(config.layer, Layer::Bottom);
+        assert_eq!(config.outputs, Outputs::Mode(OutputsMode::All));
+        assert_eq!(config.markdown.h1_scale, 1.3);
+        assert_eq!(config.markdown.spacing_scale, 0.65);
+        assert!(config.default_color.is_none());
+    }
 }

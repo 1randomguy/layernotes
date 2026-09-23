@@ -8,7 +8,6 @@ pub struct Palette {
     pub text: Color,
     pub accent: Color,
     pub border: Color,
-    pub button_bg: Color,
     pub shadow: Color,
     /// Default note background for the active theme.
     pub note: Color,
@@ -16,12 +15,12 @@ pub struct Palette {
 
 impl Palette {
     pub fn from_theme(theme: Theme) -> Self {
-        // Official Catppuccin palettes: base, surface0, surface1, text, mauve.
-        let (base, surface0, surface1, text, mauve) = match theme {
-            Theme::CatppuccinMocha => (0x1e1e2e, 0x313244, 0x45475a, 0xcdd6f4, 0xcba6f7),
-            Theme::CatppuccinMacchiato => (0x24273a, 0x363a4f, 0x494d64, 0xcad3f5, 0xc6a0f6),
-            Theme::CatppuccinFrappe => (0x303446, 0x414559, 0x51576d, 0xc6d0f5, 0xca9ee6),
-            Theme::CatppuccinLatte => (0xeff1f5, 0xccd0da, 0xbcc0cc, 0x4c4f69, 0x8839ef),
+        // Official Catppuccin palettes: base, surface1, text, mauve.
+        let (base, surface1, text, mauve) = match theme {
+            Theme::CatppuccinMocha => (0x1e1e2e, 0x45475a, 0xcdd6f4, 0xcba6f7),
+            Theme::CatppuccinMacchiato => (0x24273a, 0x494d64, 0xcad3f5, 0xc6a0f6),
+            Theme::CatppuccinFrappe => (0x303446, 0x51576d, 0xc6d0f5, 0xca9ee6),
+            Theme::CatppuccinLatte => (0xeff1f5, 0xbcc0cc, 0x4c4f69, 0x8839ef),
             Theme::Dark | Theme::Light => {
                 let iced_theme = theme.iced();
                 let extended = iced_theme.extended_palette();
@@ -29,7 +28,6 @@ impl Palette {
                     text: extended.background.base.text,
                     accent: extended.primary.base.color,
                     border: extended.background.strong.color,
-                    button_bg: extended.background.weak.color,
                     shadow: shadow_for(theme),
                     note: extended.background.base.color,
                 };
@@ -40,10 +38,30 @@ impl Palette {
             text: rgb(text),
             accent: rgb(mauve),
             border: rgb(surface1),
-            button_bg: rgb(surface0),
             shadow: shadow_for(theme),
             note: rgb(base),
         }
+    }
+}
+
+/// A slightly shifted version of `color` — darker for light colours and
+/// lighter for dark ones — used for the note header so it follows the note.
+pub fn shade(color: Color) -> Color {
+    let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    let target = if luminance > 0.5 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    };
+    mix(color, target, 0.10)
+}
+
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a,
     }
 }
 

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use iced::Subscription;
 use iced::futures::{SinkExt, StreamExt};
@@ -7,6 +8,9 @@ use inotify::{Inotify, WatchMask};
 
 use crate::config::Config;
 use crate::note::Note;
+
+/// How long to wait for the notes directory to stop changing before rescanning.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 pub fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
@@ -97,7 +101,15 @@ pub fn subscription(dir: PathBuf) -> Subscription<()> {
                         .is_none_or(|name| name.to_string_lossy().ends_with(".md"))
                 });
 
-                if relevant && output.send(()).await.is_err() {
+                if !relevant {
+                    continue;
+                }
+
+                // Coalesce bursts (e.g. a save plus our own write) into one
+                // rescan after the directory settles.
+                while let Ok(Some(_)) = tokio::time::timeout(WATCH_DEBOUNCE, events.next()).await {}
+
+                if output.send(()).await.is_err() {
                     break;
                 }
             }
