@@ -134,12 +134,15 @@ pub struct App {
 impl App {
     pub fn new(config: Config, config_path: PathBuf) -> (Self, Task<Message>) {
         let notes_path = config.notes_path();
+        // Only seed a welcome note the first time, when the notes directory
+        // does not exist yet — not every launch that happens to have no notes.
+        let first_run = !notes_path.exists();
         if let Err(e) = store::ensure_dir(&notes_path) {
             log::error!("Failed to create notes dir {}: {e}", notes_path.display());
         }
 
         let mut notes = store::load_notes(&notes_path, &config);
-        if notes.is_empty() {
+        if first_run && notes.is_empty() {
             let welcome = Note::create(&notes_path, &config, 80.0, 80.0, None);
             if let Err(e) = std::fs::write(&welcome.path, welcome.to_file_string()) {
                 log::warn!("Failed to write welcome note: {e}");
