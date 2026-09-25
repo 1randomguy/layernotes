@@ -42,6 +42,8 @@ pub fn note_card<'a>(
     // yellow note keeps a yellow (slightly shaded) bar with dark text.
     let header_bg = theme::shade(background);
     let border_width = 2.0;
+    let radius = 10.0;
+    let inner_radius = radius - border_width;
 
     let header = mouse_area(
         container(
@@ -70,12 +72,15 @@ pub fn note_card<'a>(
             background: Some(header_bg.into()),
             border: Border {
                 radius: iced::border::Radius {
-                    top_left: 8.0,
-                    top_right: 8.0,
+                    top_left: inner_radius,
+                    top_right: inner_radius,
                     ..Default::default()
                 },
                 ..Border::default()
             },
+            // Keep the header edge on the pixel grid so it lines up with the
+            // card border instead of leaving a sub-pixel seam.
+            snap: true,
             ..container::Style::default()
         }),
     )
@@ -117,16 +122,38 @@ pub fn note_card<'a>(
         .into()
     };
 
-    let card = container(iced::widget::column(vec![header.into(), body]).spacing(0))
+    // The note background is its own rounded panel rather than a `border` on
+    // the card. iced draws a border as an antialiased stroke over the same
+    // quad as the background; at fractional note positions its curved edges
+    // blend with the background and leave a hairline around the rounded
+    // corners. Two nested solid quads (ring + panel) only ever blend opaque
+    // colours with each other, so no background can bleed through.
+    let panel = container(iced::widget::column(vec![header.into(), body]).spacing(0))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(background.into()),
+            border: Border {
+                radius: inner_radius.into(),
+                ..Border::default()
+            },
+            text_color: Some(text_color),
+            // Keep the panel on the pixel grid so it lines up with the ring.
+            snap: true,
+            ..container::Style::default()
+        });
+
+    let ring_color = if selected { accent } else { border_color };
+
+    let card = container(panel)
         .width(Length::Fixed(note.meta.width))
         .height(Length::Fixed(note.meta.height))
         .padding(border_width)
         .style(move |_theme: &Theme| container::Style {
-            background: Some(background.into()),
+            background: Some(ring_color.into()),
             border: Border {
-                color: if selected { accent } else { border_color },
-                width: border_width,
-                radius: 10.0.into(),
+                radius: radius.into(),
+                ..Border::default()
             },
             shadow: Shadow {
                 color: shadow_color,
@@ -134,7 +161,7 @@ pub fn note_card<'a>(
                 blur_radius: 16.0,
             },
             text_color: Some(text_color),
-            ..container::Style::default()
+            snap: true,
         });
 
     let resize_handle = mouse_area(
