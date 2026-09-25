@@ -58,6 +58,13 @@ pub struct Note {
     /// Editor buffer, present only while the note is being edited.
     pub editor: Option<text_editor::Content>,
     pub editing: bool,
+    /// Pinned to the raised layer. Runtime-only; not persisted.
+    pub pinned: bool,
+    /// When the desired layer changes while the pointer hovers the note, keep
+    /// rendering on the old surface until the pointer leaves. Moving a note to
+    /// another surface under a stationary pointer would otherwise leave the
+    /// compositor's pointer focus on the surface the note just left.
+    pub raised_override: Option<bool>,
     pub dirty: bool,
     /// Two-step delete confirmation.
     pub confirm_delete: bool,
@@ -72,6 +79,8 @@ impl Note {
             items: Vec::new(),
             editor: None,
             editing: false,
+            pinned: false,
+            raised_override: None,
             dirty: false,
             confirm_delete: false,
         };

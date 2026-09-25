@@ -2,10 +2,11 @@
 
 Bottom-layer Wayland post-it notes, stored and edited as markdown files.
 
-`layernotes` renders one fullscreen surface **per monitor** on the layer-shell
-`Bottom` layer, so notes sit **behind normal windows but in front of the
-wallpaper**. Notes are ordinary `.md` files with a YAML frontmatter block for
-their position, size and appearance.
+`layernotes` renders two fullscreen surfaces **per monitor**: one on the
+layer-shell `Bottom` layer, so notes sit **behind normal windows but in front of
+the wallpaper**, and one raised above normal windows for notes that are pinned
+or being edited. Notes are ordinary `.md` files with a YAML frontmatter block
+for their position, size and appearance.
 
 It is built on the same stack as [ashell](https://github.com/MalpenZibo/ashell):
 Rust (edition 2024), the [iced_layershell](https://github.com/MalpenZibo/iced_layershell)
@@ -13,11 +14,14 @@ backend for iced 0.14, and the Elm architecture.
 
 ## Features
 
-- One layer-shell surface per output on the `Bottom` layer (configurable layer).
+- One bottom surface per output on the configured layer, plus a raised surface
+  for pinned or edited notes.
 - Markdown notes rendered with iced's built-in markdown widget.
 - Double-click a note to edit the raw markdown in a syntax-highlighted
   `text_editor`; double-click again (or press `Esc`/click away) for the rendered
-  preview.
+  preview. While editing, a note is temporarily raised above normal windows.
+- Pin a note to the raised layer with the `pin` button in its header; press
+  `unpin` to send it back down. Pinning is runtime-only and is reset on restart.
 - Drag notes by their header; resize from the bottom-right handle. Position and
   size are persisted to the file's frontmatter, and notes can be dragged from
   one monitor to another.
@@ -148,6 +152,9 @@ cargo build --release
   back to the preview.
 - **Move**: drag the note's header, including across monitors (release on the
   target monitor and the note is re-homed there).
+- **Pin**: click `pin` to keep the note above normal windows; click `unpin` to
+  return it to the bottom layer. Editing a note raises it too, until you leave
+  edit mode.
 - **Resize**: drag the bottom-right corner.
 - **Delete**: click `x`, then `sure?` to confirm.
 - **Disconnected monitor**: click the bottom-right count button to open the

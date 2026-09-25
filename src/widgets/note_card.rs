@@ -1,6 +1,8 @@
 use uuid::Uuid;
 
-use iced::widget::{Space, Stack, container, markdown, mouse_area, scrollable, text, text_editor};
+use iced::widget::{
+    Space, Stack, container, markdown, mouse_area, scrollable, svg, text, text_editor,
+};
 use iced::{
     Border, Color, Element, Length, Padding, Shadow, SurfaceId, Theme, Vector, alignment, mouse,
 };
@@ -55,6 +57,10 @@ pub fn note_card<'a>(
                     .wrapping(text::Wrapping::Word)
                     .into(),
                 icon_button(
+                    pin_icon(if note.pinned { accent } else { text_color }, note.pinned),
+                    Message::TogglePin(id),
+                ),
+                text_button(
                     if note.confirm_delete { "sure?" } else { "x" },
                     Message::DeleteNote(id),
                     if note.confirm_delete {
@@ -189,18 +195,41 @@ pub fn note_card<'a>(
         .into()
 }
 
-fn icon_button<'a>(label: &'a str, message: Message, color: Color) -> Element<'a, Message> {
-    mouse_area(
-        container(text(label).size(12).color(color)).padding(Padding {
-            top: 2.0,
-            right: 6.0,
-            bottom: 2.0,
-            left: 6.0,
-        }),
-    )
+/// A pushpin symbol, drawn as a monochrome SVG so it does not depend on a
+/// font having the glyph.
+const PIN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z"/></svg>"#;
+
+/// The pin toggle. Upright and tinted with the accent when pinned, tilted and
+/// muted otherwise.
+fn pin_icon<'a>(color: Color, pinned: bool) -> Element<'a, Message> {
+    let rotation = if pinned {
+        0.0
+    } else {
+        std::f32::consts::FRAC_PI_4
+    };
+
+    svg(svg::Handle::from_memory(PIN_SVG))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .rotation(rotation)
+        .style(move |_theme: &Theme, _status| svg::Style { color: Some(color) })
+        .into()
+}
+
+fn icon_button<'a>(content: Element<'a, Message>, message: Message) -> Element<'a, Message> {
+    mouse_area(container(content).padding(Padding {
+        top: 2.0,
+        right: 6.0,
+        bottom: 2.0,
+        left: 6.0,
+    }))
     .on_press(message)
     .interaction(mouse::Interaction::Pointer)
     .into()
+}
+
+fn text_button<'a>(label: &'a str, message: Message, color: Color) -> Element<'a, Message> {
+    icon_button(text(label).size(12).color(color).into(), message)
 }
 
 fn markdown_settings(

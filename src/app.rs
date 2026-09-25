@@ -16,7 +16,7 @@ use iced::{
 use crate::config::{self, Config};
 use crate::geometry::{self, OutputRect};
 use crate::note::Note;
-use crate::outputs::Outputs;
+use crate::outputs::{Outputs, SurfaceKind};
 use crate::store;
 use crate::theme::Palette;
 use crate::widgets;
@@ -93,6 +93,7 @@ pub enum Message {
     NewNote(SurfaceId),
     Select(Uuid),
     ToggleEdit(Uuid),
+    TogglePin(Uuid),
     DeleteNote(Uuid),
     DragStart(SurfaceId, Uuid),
     ResizeStart(SurfaceId, Uuid),
@@ -147,7 +148,8 @@ impl App {
         }
 
         let palette = Palette::from_theme(config.theme);
-        let outputs = Outputs::new(config.layer);
+        let mut outputs = Outputs::new(config.layer);
+        let top_surfaces = outputs.ensure_top_surfaces::<Message>();
         log::info!("Using theme {:?}", config.theme);
 
         (
@@ -171,7 +173,7 @@ impl App {
                 board: None,
                 last_regions: HashMap::new(),
             },
-            Task::none(),
+            top_surfaces,
         )
     }
 
@@ -219,6 +221,7 @@ impl App {
             Message::NewNote(surface) => self.new_note(surface),
             Message::Select(id) => self.select(id),
             Message::ToggleEdit(id) => self.toggle_edit(id),
+            Message::TogglePin(id) => self.toggle_pin(id),
             Message::DeleteNote(id) => self.delete_note(id),
             Message::DragStart(surface, id) => {
                 self.drag_start(surface, id);
@@ -279,21 +282,32 @@ impl App {
                 .into();
         }
 
-        let Some(entry) = self.outputs.get(id) else {
+        let Some((entry, kind)) = self.outputs.entry_for_surface(id) else {
             return Space::new().width(Length::Fill).height(Length::Fill).into();
         };
         let surface_name = entry.name.clone();
         let surface_size = entry.logical_size;
+        let raised_surface = kind == SurfaceKind::Top;
 
-        let mut stack = Stack::new().push(
-            mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                .on_press(Message::BackgroundPressed)
-                .on_right_press(Message::BackgroundPressed)
-                .on_double_click(Message::NewNote(id)),
-        );
+        // The bottom surface fills the desktop so a double-click can create a
+        // note. The raised surface only hosts its notes, so it uses a plain
+        // fullscreen spacer to give the stack the output's size for `pin`.
+        let mut stack = if raised_surface {
+            Stack::new().push(Space::new().width(Length::Fill).height(Length::Fill))
+        } else {
+            Stack::new().push(
+                mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                    .on_press(Message::BackgroundPressed)
+                    .on_right_press(Message::BackgroundPressed)
+                    .on_double_click(Message::NewNote(id)),
+            )
+        };
 
         for note in &self.notes {
             if self.target_output(note).as_deref() != Some(surface_name.as_str()) {
+                continue;
+            }
+            if note_is_raised(note) != raised_surface {
                 continue;
             }
             // While a note is dragged off the edge (cross-monitor drag) it can be
@@ -318,7 +332,7 @@ impl App {
         // notes stranded on disconnected monitors. Placed by a fullscreen
         // container aligned to the corner so it never depends on button size.
         let orphan_count: usize = self.orphan_groups().iter().map(|(_, ids)| ids.len()).sum();
-        if orphan_count > 0 {
+        if orphan_count > 0 && !raised_surface {
             let button = widgets::rescue_button(id, orphan_count, &self.palette);
             stack = stack.push(
                 container(button)
@@ -411,18 +425,14 @@ impl App {
     /// of ours.
     fn output_name_for_window(&self, window: window::Id) -> Option<String> {
         self.outputs
-            .entries
-            .iter()
-            .find(|entry| window::Id::from(entry.surface_id) == window)
+            .entry_for_window(window)
             .map(|entry| entry.name.clone())
     }
 
     /// The logical size of the output backing the given window id, if known.
     fn output_size_for_window(&self, window: window::Id) -> Option<(f32, f32)> {
         self.outputs
-            .entries
-            .iter()
-            .find(|entry| window::Id::from(entry.surface_id) == window)
+            .entry_for_window(window)
             .and_then(|entry| entry.logical_size)
             .map(|(w, h)| (w as f32, h as f32))
     }
@@ -679,6 +689,11 @@ impl App {
         };
         log::info!("Toggling layer to {layer:?}");
         self.config.layer = layer;
+        // `set_layer` resets each surface's input region to the full surface.
+        // Forget the cached regions so `sync_input_regions` pushes them again,
+        // otherwise a surface whose desired region is unchanged keeps the full
+        // region and swallows every click on the raised layer.
+        self.last_regions.clear();
         self.outputs.apply_layer(layer)
     }
 
@@ -692,26 +707,31 @@ impl App {
     fn desired_input_regions(&self) -> HashMap<SurfaceId, Option<Vec<InputRegionRect>>> {
         let orphan_count: usize = self.orphan_groups().iter().map(|(_, ids)| ids.len()).sum();
 
-        self.outputs
-            .entries
-            .iter()
-            .map(|entry| {
-                let region = match self.config.layer {
-                    config::Layer::Bottom => None,
-                    config::Layer::Background => Some(Vec::new()),
-                    config::Layer::Top | config::Layer::Overlay => {
-                        Some(self.surface_input_region(entry, orphan_count))
-                    }
-                };
-                (entry.surface_id, region)
-            })
-            .collect()
+        let mut regions = HashMap::new();
+        for entry in &self.outputs.entries {
+            let bottom = match self.config.layer {
+                config::Layer::Bottom => None,
+                config::Layer::Background => Some(Vec::new()),
+                config::Layer::Top | config::Layer::Overlay => {
+                    Some(self.surface_input_region(entry, false, orphan_count))
+                }
+            };
+            regions.insert(entry.surface_id, bottom);
+
+            // The raised surface never covers the desktop, so its region is
+            // always limited to the notes it renders.
+            if let Some(top) = entry.top_surface {
+                regions.insert(top, Some(self.surface_input_region(entry, true, 0)));
+            }
+        }
+        regions
     }
 
     /// Rectangles of everything clickable on `entry` while notes are raised.
     fn surface_input_region(
         &self,
         entry: &crate::outputs::OutputEntry,
+        raised: bool,
         orphan_count: usize,
     ) -> Vec<InputRegionRect> {
         let Some((width, height)) = entry.logical_size.map(|(w, h)| (w as f32, h as f32)) else {
@@ -721,6 +741,9 @@ impl App {
         let mut rects = Vec::new();
         for note in &self.notes {
             if self.target_output(note).as_deref() != Some(entry.name.as_str()) {
+                continue;
+            }
+            if note_is_raised(note) != raised {
                 continue;
             }
             if let Some(rect) = clip_rect(
@@ -735,8 +758,10 @@ impl App {
             }
         }
 
-        // The rescue button pinned to the bottom-right corner.
-        if orphan_count > 0
+        // The rescue button pinned to the bottom-right corner of the bottom
+        // surface.
+        if !raised
+            && orphan_count > 0
             && let Some(rect) = clip_rect(width, height, width - 90.0, height - 60.0, 90.0, 60.0)
         {
             rects.push(rect);
@@ -855,11 +880,108 @@ impl App {
         if let Some(note) = self.find_note_mut(id) {
             note.editor_mut();
             note.editing = true;
+            // Editing always goes to the raised surface, so any deferred move
+            // is moot.
+            note.raised_override = None;
         }
         self.active = Some(id);
         tasks.push(focus_editor(widgets::editor_id(id)));
         tasks.push(self.rebuild_catchers());
         Task::batch(tasks)
+    }
+
+    /// Pin or unpin a note, moving it between the bottom and raised layers.
+    /// Editing keeps a note raised regardless of this flag. Pinning is
+    /// runtime-only and is never written to the note file.
+    ///
+    /// If the pointer is hovering the note, the surface move is deferred until
+    /// it leaves: changing the surface under a stationary pointer leaves the
+    /// compositor's focus on the old surface, so a second click would be lost.
+    fn toggle_pin(&mut self, id: Uuid) -> Task<Message> {
+        let Some(note) = self.find_note(id) else {
+            return Task::none();
+        };
+        let was_raised = note_is_raised(note);
+        let cursor_over = self.cursor_within_note(note);
+
+        let note = self.find_note_mut(id).expect("note just looked up");
+        note.pinned = !note.pinned;
+        note.raised_override =
+            (note_wants_raised(note) != was_raised && cursor_over).then_some(was_raised);
+        Task::none()
+    }
+
+    /// The surface a note is currently rendered on.
+    fn note_surface(&self, note: &Note) -> Option<SurfaceId> {
+        let entry = self
+            .target_output(note)
+            .and_then(|name| self.outputs.entries.iter().find(|entry| entry.name == name))?;
+        if note_is_raised(note) {
+            entry.top_surface
+        } else {
+            Some(entry.surface_id)
+        }
+    }
+
+    /// Whether the last known pointer position is inside the note's rectangle,
+    /// on the surface the note is currently rendered on.
+    fn cursor_within_note(&self, note: &Note) -> bool {
+        let Some(surface) = self.note_surface(note) else {
+            return false;
+        };
+        let Some(point) = self.cursor.get(&window::Id::from(surface)) else {
+            return false;
+        };
+        point.x >= note.meta.x
+            && point.x <= note.meta.x + note.meta.width
+            && point.y >= note.meta.y
+            && point.y <= note.meta.y + note.meta.height
+    }
+
+    /// Release deferred layer moves once the pointer is no longer over the
+    /// note, allowing it to move to its desired layer.
+    fn release_layer_overrides(&mut self, window: window::Id, point: Point) {
+        let ids: Vec<Uuid> = self
+            .notes
+            .iter()
+            .filter(|note| note.raised_override.is_some())
+            .filter(|note| {
+                let on_window = self
+                    .note_surface(note)
+                    .is_some_and(|surface| window::Id::from(surface) == window);
+                let inside = point.x >= note.meta.x
+                    && point.x <= note.meta.x + note.meta.width
+                    && point.y >= note.meta.y
+                    && point.y <= note.meta.y + note.meta.height;
+                !(on_window && inside)
+            })
+            .map(|note| note.meta.id)
+            .collect();
+        for id in ids {
+            if let Some(note) = self.find_note_mut(id) {
+                note.raised_override = None;
+            }
+        }
+    }
+
+    /// Release every deferred layer move on `window`, e.g. when the pointer
+    /// leaves its surface entirely.
+    fn release_overrides_on(&mut self, window: window::Id) {
+        let ids: Vec<Uuid> = self
+            .notes
+            .iter()
+            .filter(|note| note.raised_override.is_some())
+            .filter(|note| {
+                self.note_surface(note)
+                    .is_some_and(|surface| window::Id::from(surface) == window)
+            })
+            .map(|note| note.meta.id)
+            .collect();
+        for id in ids {
+            if let Some(note) = self.find_note_mut(id) {
+                note.raised_override = None;
+            }
+        }
     }
 
     fn exit_editing(&mut self) -> Task<Message> {
@@ -1040,6 +1162,7 @@ impl App {
 
     fn cursor_moved(&mut self, window: window::Id, point: Point) -> Task<Message> {
         self.cursor.insert(window, point);
+        self.release_layer_overrides(window, point);
 
         // Hand an in-flight drag/resize over to this surface if it started on a
         // different one (the pointer crossed to another monitor).
@@ -1378,6 +1501,10 @@ impl App {
             self.pointer_over = None;
         }
 
+        // The pointer is no longer over anything on this surface, so any
+        // deferred layer move here can be released.
+        self.release_overrides_on(window);
+
         let dragging = self.drag.is_some_and(|drag| drag.window == window)
             || self.resize.is_some_and(|resize| resize.window == window);
 
@@ -1484,6 +1611,9 @@ impl App {
                 merged.push(note);
             } else if let Some(mut fresh) = by_id.remove(&note.meta.id) {
                 fresh.confirm_delete = note.confirm_delete;
+                // Pinning is runtime-only, so keep it across a reload.
+                fresh.pinned = note.pinned;
+                fresh.raised_override = note.raised_override;
                 merged.push(fresh);
             }
         }
@@ -1565,6 +1695,7 @@ impl App {
 
                 let mut tasks = Vec::new();
                 if layer_changed {
+                    self.last_regions.clear();
                     tasks.push(self.outputs.recreate_all(self.config.layer));
                 }
                 if notes_dir_changed {
@@ -1592,6 +1723,17 @@ impl App {
             log::warn!("Failed to open link {url}: {e}");
         }
     }
+}
+
+/// Whether a note renders on the raised surface: either explicitly pinned, or
+/// temporarily while it is being edited.
+fn note_is_raised(note: &Note) -> bool {
+    note.editing || note.raised_override.unwrap_or(note.pinned)
+}
+
+/// The raised state a note *wants*, ignoring any deferral in progress.
+fn note_wants_raised(note: &Note) -> bool {
+    note.pinned || note.editing
 }
 
 fn sync_body_from_editor(note: &mut Note) {
