@@ -1,6 +1,6 @@
 use iced::{
     Anchor, KeyboardInteractivity, Layer, LayerShellSettings, OutputId, SurfaceId, Task,
-    destroy_layer_surface, new_layer_surface,
+    destroy_layer_surface, new_layer_surface, set_layer,
 };
 
 use crate::config;
@@ -133,6 +133,21 @@ impl Outputs {
         {
             entry.logical_size = size;
         }
+    }
+
+    /// Move every existing surface to `layer` without recreating it.
+    ///
+    /// Recreating a surface makes some compositors (e.g. niri) hand keyboard
+    /// focus to the freshly mapped `OnDemand` layer surface. Changing the layer
+    /// of a mapped surface in place keeps the current focus untouched.
+    pub fn apply_layer<M: 'static>(&mut self, layer: config::Layer) -> Task<M> {
+        self.layer = layer;
+        let iced_layer = map_layer(layer);
+        Task::batch(
+            self.entries
+                .iter()
+                .map(|entry| set_layer(entry.surface_id, iced_layer)),
+        )
     }
 
     /// Recreate every surface, e.g. after the configured layer changed.

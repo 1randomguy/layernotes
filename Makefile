@@ -9,7 +9,7 @@ help:
 	@echo "Targets:"
 	@echo "  help          Show this help message"
 	@echo "  build         Build the project"
-	@echo "  start         Run the build"
+	@echo "  run           Run the build"
 	@echo "  install       Install the build (supports DESTDIR and PREFIX)"
 	@echo "  fmt           Format the code"
 	@echo "  check         Format, check and lint the code"
@@ -18,7 +18,7 @@ help:
 build:
 	cargo build --release
 
-start: build
+run: build
 	./target/release/layernotes
 
 install: build

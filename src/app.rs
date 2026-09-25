@@ -80,6 +80,8 @@ pub enum Message {
     OutputEvent(OutputEvent),
     ConfigChanged,
     NotesChanged,
+    ToggleLayer,
+    AddNote,
     EscapePressed,
     BackgroundPressed,
     ClickCatcherPressed,
@@ -123,6 +125,9 @@ pub struct App {
     catchers: Vec<Catcher>,
     output_geometries: HashMap<String, OutputRect>,
     board: Option<BoardSurface>,
+    /// Last input region pushed to each output surface, so we only re-apply it
+    /// when it actually changes.
+    last_regions: HashMap<SurfaceId, Option<Vec<InputRegionRect>>>,
 }
 
 impl App {
@@ -164,6 +169,7 @@ impl App {
                 catchers: Vec::new(),
                 output_geometries: geometry::enumerate(),
                 board: None,
+                last_regions: HashMap::new(),
             },
             Task::none(),
         )
@@ -179,7 +185,12 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        Task::batch(vec![task, self.prune_catchers(), self.prune_board()])
+        Task::batch(vec![
+            task,
+            self.prune_catchers(),
+            self.prune_board(),
+            self.sync_input_regions(),
+        ])
     }
 
     fn handle(&mut self, message: Message) -> Task<Message> {
@@ -190,6 +201,8 @@ impl App {
                 self.reload_notes();
                 Task::none()
             }
+            Message::ToggleLayer => self.toggle_layer(),
+            Message::AddNote => self.add_note(),
             Message::EscapePressed => {
                 if self.board.is_some() {
                     self.close_rescue_board()
@@ -330,6 +343,10 @@ impl App {
             iced::output_events().map(Message::OutputEvent),
             store::subscription(self.config.notes_path()).map(|()| Message::NotesChanged),
             config::subscription(&self.config_path).map(|()| Message::ConfigChanged),
+            crate::ipc::subscription().map(|command| match command {
+                crate::ipc::IpcCommand::ToggleLayer => Message::ToggleLayer,
+                crate::ipc::IpcCommand::AddNote => Message::AddNote,
+            }),
             listen_with(|event, _status, window| match event {
                 iced::event::Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(window, position))
@@ -650,6 +667,104 @@ impl App {
         }
     }
 
+    // -- layer -------------------------------------------------------------
+
+    /// Toggle the note surfaces between `Bottom` (behind windows) and `Top`
+    /// (above windows). The change is transient: it is not written back to the
+    /// config file, so a config reload or restart restores the configured layer.
+    fn toggle_layer(&mut self) -> Task<Message> {
+        let layer = match self.config.layer {
+            config::Layer::Top => config::Layer::Bottom,
+            _ => config::Layer::Top,
+        };
+        log::info!("Toggling layer to {layer:?}");
+        self.config.layer = layer;
+        self.outputs.apply_layer(layer)
+    }
+
+    /// The input region each output surface should have for the current layer.
+    ///
+    /// On `Bottom` the fullscreen surface keeps its whole input region (so
+    /// double-clicking empty desktop can create a note). On `Top`/`Overlay` it
+    /// would sit above normal windows and swallow every click, so the region is
+    /// limited to the notes (and the rescue button) and clicks elsewhere fall
+    /// through to whatever is below.
+    fn desired_input_regions(&self) -> HashMap<SurfaceId, Option<Vec<InputRegionRect>>> {
+        let orphan_count: usize = self.orphan_groups().iter().map(|(_, ids)| ids.len()).sum();
+
+        self.outputs
+            .entries
+            .iter()
+            .map(|entry| {
+                let region = match self.config.layer {
+                    config::Layer::Bottom => None,
+                    config::Layer::Background => Some(Vec::new()),
+                    config::Layer::Top | config::Layer::Overlay => {
+                        Some(self.surface_input_region(entry, orphan_count))
+                    }
+                };
+                (entry.surface_id, region)
+            })
+            .collect()
+    }
+
+    /// Rectangles of everything clickable on `entry` while notes are raised.
+    fn surface_input_region(
+        &self,
+        entry: &crate::outputs::OutputEntry,
+        orphan_count: usize,
+    ) -> Vec<InputRegionRect> {
+        let Some((width, height)) = entry.logical_size.map(|(w, h)| (w as f32, h as f32)) else {
+            return Vec::new();
+        };
+
+        let mut rects = Vec::new();
+        for note in &self.notes {
+            if self.target_output(note).as_deref() != Some(entry.name.as_str()) {
+                continue;
+            }
+            if let Some(rect) = clip_rect(
+                width,
+                height,
+                note.meta.x,
+                note.meta.y,
+                note.meta.width,
+                note.meta.height,
+            ) {
+                rects.push(rect);
+            }
+        }
+
+        // The rescue button pinned to the bottom-right corner.
+        if orphan_count > 0
+            && let Some(rect) = clip_rect(width, height, width - 90.0, height - 60.0, 90.0, 60.0)
+        {
+            rects.push(rect);
+        }
+
+        rects
+    }
+
+    /// Push each output surface's input region to the compositor, but only when
+    /// it changed since the last update.
+    fn sync_input_regions(&mut self) -> Task<Message> {
+        // Regions only matter between gestures; updating them on every pointer
+        // motion would spam the compositor during a drag.
+        if self.drag.is_some() || self.resize.is_some() {
+            return Task::none();
+        }
+
+        let desired = self.desired_input_regions();
+        let mut tasks = Vec::new();
+        for (surface, region) in &desired {
+            if self.last_regions.get(surface) != Some(region) {
+                tasks.push(set_input_region(*surface, region.clone()));
+            }
+        }
+        self.last_regions = desired;
+        Task::batch(tasks)
+    }
+
     /// Cascade position for a note moved onto `target_name`.
     fn cascade_position(&self, target_name: &str) -> (f32, f32) {
         let count = self
@@ -779,6 +894,22 @@ impl App {
             .or_else(|| self.outputs.primary_name().map(str::to_owned));
 
         let (x, y) = self.new_note_position(surface);
+        self.create_note(output, x, y)
+    }
+
+    /// Create a note from IPC, on the primary output. There is no pointer on a
+    /// layer surface to anchor to, so it is cascaded like a fresh note.
+    fn add_note(&mut self) -> Task<Message> {
+        let Some(entry) = self.outputs.entries.first() else {
+            return Task::none();
+        };
+        let output = Some(entry.name.clone());
+        let (x, y) = self.cascade_position(&entry.name);
+        self.create_note(output, x, y)
+    }
+
+    /// Insert a note, drop straight into editing it and persist it.
+    fn create_note(&mut self, output: Option<String>, x: f32, y: f32) -> Task<Message> {
         let note = Note::create(&self.config.notes_path(), &self.config, x, y, output);
         let id = note.meta.id;
         self.notes.push(note);
@@ -1403,6 +1534,11 @@ impl App {
                 Task::batch(vec![task, rebuild])
             }
             OutputEvent::SurfaceEnteredOutput { surface, .. } => {
+                // A surface may have been created after we pushed its input
+                // region, in which case the command was dropped; forget it so
+                // the region is re-applied on this update.
+                self.last_regions.remove(&surface);
+
                 // Once a catcher is mapped, (re)apply the input regions.
                 if self
                     .catchers
@@ -1470,6 +1606,21 @@ fn sync_body_from_editor(note: &mut Note) {
 
 fn focus_editor<M: Send + 'static>(id: iced::widget::Id) -> Task<M> {
     iced_runtime::task::widget(iced::core::widget::operation::focusable::focus::<M>(id)).into()
+}
+
+/// Clip a rectangle to a `width`x`height` surface, returning `None` when it
+/// lies fully outside it.
+fn clip_rect(width: f32, height: f32, x: f32, y: f32, w: f32, h: f32) -> Option<InputRegionRect> {
+    let nx = x.max(0.0).min(width);
+    let ny = y.max(0.0).min(height);
+    let nx2 = (x + w).clamp(nx, width);
+    let ny2 = (y + h).clamp(ny, height);
+    (nx2 > nx && ny2 > ny).then_some(InputRegionRect {
+        x: nx as i32,
+        y: ny as i32,
+        width: (nx2 - nx) as i32,
+        height: (ny2 - ny) as i32,
+    })
 }
 
 /// Rectangles covering an `width`x`height` area minus the `(x, y, w, h)` hole.
@@ -1546,6 +1697,38 @@ fn map_across_edges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_rect_inside_is_unchanged() {
+        assert_eq!(
+            clip_rect(100.0, 100.0, 10.0, 20.0, 30.0, 40.0),
+            Some(InputRegionRect {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn clip_rect_partial_is_clamped() {
+        assert_eq!(
+            clip_rect(100.0, 100.0, 80.0, 90.0, 50.0, 50.0),
+            Some(InputRegionRect {
+                x: 80,
+                y: 90,
+                width: 20,
+                height: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn clip_rect_outside_is_none() {
+        assert_eq!(clip_rect(100.0, 100.0, 120.0, 10.0, 30.0, 30.0), None);
+        assert_eq!(clip_rect(100.0, 100.0, -40.0, 10.0, 30.0, 30.0), None);
+    }
 
     #[test]
     fn complement_region_splits_around_hole() {

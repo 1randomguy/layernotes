@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod geometry;
+mod ipc;
 mod note;
 mod outputs;
 mod store;
@@ -22,10 +23,30 @@ struct Args {
     /// Path to the configuration file.
     #[arg(short, long, value_parser = clap::value_parser!(PathBuf))]
     config_path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Send a message to a running layernotes instance
+    Msg {
+        #[command(subcommand)]
+        command: ipc::IpcCommand,
+    },
 }
 
 fn main() -> iced::Result {
     let args = Args::parse();
+
+    if let Some(Command::Msg { command }) = &args.command {
+        if let Err(e) = ipc::run_client(command) {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
 
     let _logger = Logger::with(
         LogSpecBuilder::new()

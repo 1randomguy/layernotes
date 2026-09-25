@@ -101,6 +101,25 @@ Per-note appearance can still be overridden in the note's own frontmatter via
 
 A `--config-path` flag overrides the config location.
 
+## IPC
+
+A running `layernotes` listens on a Unix socket
+(`$XDG_RUNTIME_DIR/layernotes.sock`). Send commands to it with the `msg`
+subcommand:
+
+```bash
+layernotes msg toggle-layer
+layernotes msg add-note
+```
+
+- `toggle-layer` — move the notes between the `Bottom` layer (behind windows,
+  the configured default) and the `Top` layer (above windows). While raised the
+  fullscreen surface only captures pointer input over the notes, so the rest of
+  the desktop stays clickable. The change is not written to the config file and
+  is reset on restart.
+- `add-note` — create a new note on the primary output and start editing it.
+  Handy to bind to a key.
+
 ## Build & run
 
 With Nix flakes (provides the Rust toolchain and all system dependencies):
@@ -142,6 +161,7 @@ src/
 ├── main.rs      # CLI, logging, config load, layer-shell application setup
 ├── app.rs       # App state, Message, update, view, subscriptions
 ├── config.rs    # TOML config + hot reload
+├── ipc.rs       # Unix socket IPC (client + server + subscription)
 ├── note.rs      # Note model + YAML frontmatter (de)serialization
 ├── store.rs     # load/save + notes directory watcher
 ├── outputs.rs   # one fullscreen layer surface per monitor

@@ -48,6 +48,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", default-features = false, features = [
   "fs",
   "time",
+  "net",
 ] }
 wayland-client = "0.31"
 

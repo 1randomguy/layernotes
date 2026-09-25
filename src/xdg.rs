@@ -5,6 +5,13 @@ pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
+/// `$XDG_RUNTIME_DIR`, if it is set to an absolute directory. Used for the IPC
+/// socket.
+pub fn runtime_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env::var_os("XDG_RUNTIME_DIR")?);
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
+}
+
 pub fn data_dir() -> PathBuf {
     if let Some(dir) = env::var_os("XDG_DATA_HOME") {
         PathBuf::from(dir)
