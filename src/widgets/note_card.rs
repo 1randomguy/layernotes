@@ -60,14 +60,16 @@ pub fn note_card<'a>(
                     pin_icon(if note.pinned { accent } else { text_color }, note.pinned),
                     Message::TogglePin(id),
                 ),
-                text_button(
-                    if note.confirm_delete { "sure?" } else { "x" },
+                icon_button(
+                    delete_icon(
+                        note.confirm_delete,
+                        if note.confirm_delete {
+                            accent
+                        } else {
+                            text_color
+                        },
+                    ),
                     Message::DeleteNote(id),
-                    if note.confirm_delete {
-                        accent
-                    } else {
-                        text_color
-                    },
                 ),
             ])
             .align_y(alignment::Vertical::Center)
@@ -195,9 +197,19 @@ pub fn note_card<'a>(
         .into()
 }
 
-/// A pushpin symbol, drawn as a monochrome SVG so it does not depend on a
-/// font having the glyph.
+/// Icon glyphs, drawn as monochrome SVGs so they do not depend on a font
+/// having the glyph.
 const PIN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z"/></svg>"#;
+const CLOSE_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>"#;
+const CHECK_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>"#;
+
+fn icon<'a>(bytes: &'static [u8], color: Color) -> Element<'a, Message> {
+    svg(svg::Handle::from_memory(bytes))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .style(move |_theme: &Theme, _status| svg::Style { color: Some(color) })
+        .into()
+}
 
 /// The pin toggle. Upright and tinted with the accent when pinned, tilted and
 /// muted otherwise.
@@ -216,6 +228,12 @@ fn pin_icon<'a>(color: Color, pinned: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// The two-step delete: a close mark, replaced by a check mark once the first
+/// press has armed the deletion.
+fn delete_icon<'a>(confirming: bool, color: Color) -> Element<'a, Message> {
+    icon(if confirming { CHECK_SVG } else { CLOSE_SVG }, color)
+}
+
 fn icon_button<'a>(content: Element<'a, Message>, message: Message) -> Element<'a, Message> {
     mouse_area(container(content).padding(Padding {
         top: 2.0,
@@ -226,10 +244,6 @@ fn icon_button<'a>(content: Element<'a, Message>, message: Message) -> Element<'
     .on_press(message)
     .interaction(mouse::Interaction::Pointer)
     .into()
-}
-
-fn text_button<'a>(label: &'a str, message: Message, color: Color) -> Element<'a, Message> {
-    icon_button(text(label).size(12).color(color).into(), message)
 }
 
 fn markdown_settings(
