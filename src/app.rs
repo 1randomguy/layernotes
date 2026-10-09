@@ -10,7 +10,8 @@ use iced::widget::{Space, Stack, container, mouse_area, pin, text_editor};
 use iced::{
     Anchor, Element, InputRegionRect, KeyboardInteractivity, Layer, LayerShellSettings, Length,
     OutputEvent, OutputId, Padding, Point, Size, Subscription, SurfaceId, Task, Theme, alignment,
-    destroy_layer_surface, keyboard, mouse, new_layer_surface, set_input_region, window,
+    destroy_layer_surface, keyboard, mouse, new_layer_surface, set_input_region,
+    set_keyboard_interactivity, window,
 };
 
 use crate::config::{self, Config};
@@ -129,6 +130,9 @@ pub struct App {
     /// Last input region pushed to each output surface, so we only re-apply it
     /// when it actually changes.
     last_regions: HashMap<SurfaceId, Option<Vec<InputRegionRect>>>,
+    /// Last keyboard interactivity pushed to each output surface, so we only
+    /// re-apply it when it actually changes.
+    last_keyboard: HashMap<SurfaceId, KeyboardInteractivity>,
 }
 
 impl App {
@@ -175,6 +179,7 @@ impl App {
                 output_geometries: geometry::enumerate(),
                 board: None,
                 last_regions: HashMap::new(),
+                last_keyboard: HashMap::new(),
             },
             top_surfaces,
         )
@@ -195,6 +200,7 @@ impl App {
             self.prune_catchers(),
             self.prune_board(),
             self.sync_input_regions(),
+            self.sync_keyboard_interactivity(),
         ])
     }
 
@@ -790,6 +796,48 @@ impl App {
             }
         }
         self.last_regions = desired;
+        Task::batch(tasks)
+    }
+
+    /// The keyboard interactivity each surface should have. The raised surface
+    /// hosting the note being edited needs `Exclusive`: entering edit mode moves
+    /// the note to that surface, but the compositor keeps keyboard focus on the
+    /// surface that was clicked, so without an explicit grab the editor would
+    /// not receive the keys until the user clicks it a second time. Everything
+    /// else stays `OnDemand`.
+    fn desired_keyboard_interactivity(&self) -> HashMap<SurfaceId, KeyboardInteractivity> {
+        let editing = self.editing_note();
+        let mut desired = HashMap::new();
+        for entry in &self.outputs.entries {
+            desired.insert(entry.surface_id, KeyboardInteractivity::OnDemand);
+            if let Some(top) = entry.top_surface {
+                let hosts_edit = editing
+                    .and_then(|id| self.find_note(id))
+                    .is_some_and(|note| {
+                        self.target_output(note).as_deref() == Some(entry.name.as_str())
+                    });
+                let interactivity = if hosts_edit {
+                    KeyboardInteractivity::Exclusive
+                } else {
+                    KeyboardInteractivity::OnDemand
+                };
+                desired.insert(top, interactivity);
+            }
+        }
+        desired
+    }
+
+    /// Push each surface's keyboard interactivity to the compositor, but only
+    /// when it changed since the last update.
+    fn sync_keyboard_interactivity(&mut self) -> Task<Message> {
+        let desired = self.desired_keyboard_interactivity();
+        let mut tasks = Vec::new();
+        for (surface, interactivity) in &desired {
+            if self.last_keyboard.get(surface) != Some(interactivity) {
+                tasks.push(set_keyboard_interactivity(*surface, *interactivity));
+            }
+        }
+        self.last_keyboard = desired;
         Task::batch(tasks)
     }
 
