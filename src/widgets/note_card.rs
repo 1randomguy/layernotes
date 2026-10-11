@@ -19,7 +19,6 @@ pub fn editor_id(id: Uuid) -> iced::widget::Id {
 pub fn note_card<'a>(
     note: &'a Note,
     surface: SurfaceId,
-    selected: bool,
     config: &Config,
     palette: &Palette,
 ) -> Element<'a, Message> {
@@ -151,7 +150,7 @@ pub fn note_card<'a>(
             ..container::Style::default()
         });
 
-    let ring_color = if selected { accent } else { border_color };
+    let ring_color = if note.editing { accent } else { border_color };
 
     let card = container(panel)
         .width(Length::Fixed(note.meta.width))

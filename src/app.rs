@@ -332,8 +332,7 @@ impl App {
                     continue;
                 }
             }
-            let selected = self.active == Some(note.meta.id);
-            let card = widgets::note_card(note, id, selected, &self.config, &self.palette);
+            let card = widgets::note_card(note, id, &self.config, &self.palette);
             stack = stack.push(pin(card).x(note.meta.x).y(note.meta.y));
         }
 
